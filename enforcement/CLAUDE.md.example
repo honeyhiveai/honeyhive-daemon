@@ -1,0 +1,33 @@
+# Coding Agent Efficiency Guidelines
+
+## Discovery & Search — use CLI tools
+- Use `rg` (ripgrep) for code search — it's faster and more powerful than built-in Grep. Chain with `jq`, `yq`, `awk` for complex queries.
+- Use `fd` for file discovery — it's faster than find and has better defaults.
+- Pipe and chain freely: `rg 'pattern' -l | xargs rg 'other_pattern'` is better than multiple built-in tool calls.
+- Use `jq` for JSON exploration and `yq` for YAML — these are far more capable than reading files and manually parsing.
+
+## File Editing — use the native Edit tool
+- ALWAYS use the native Edit tool for modifying files, not sed -i or awk -i.
+- Edit is more accurate (exact string matching prevents wrong-location edits) and supports parallel calls across multiple files.
+- The one exception: bulk renames across many files where sed -i with a tested regex is more practical.
+
+## Search Strategy
+- Before exploring, form a hypothesis about where the relevant code lives.
+- Use `rg` with regex patterns to find specific identifiers — one targeted rg is better than 50 Glob calls.
+- If you need to understand project structure, read package.json/pyproject.toml first, then use `fd` or `ls` to confirm layout.
+- Do NOT call file_search/Glob more than 10 times in a row without reading a file or taking action.
+
+## Planning Before Acting
+- For tasks touching more than 3 files, plan your approach before making changes.
+- State what you're about to do and why before each multi-step operation.
+- After every 10 tool calls, briefly assess whether you're making progress or going in circles.
+
+## Subagents
+- When using subagents/Agent tool, always provide a clear, complete task description.
+- Do not spawn subagents for tasks you can do in 2-3 tool calls yourself.
+- Monitor subagent results — do not ignore their output.
+
+## Session Hygiene
+- If you've made more than 200 tool calls, summarize your progress so far.
+- If you find yourself repeating the same search or command, stop and reconsider your approach.
+- Commit working changes incrementally rather than accumulating a massive diff.

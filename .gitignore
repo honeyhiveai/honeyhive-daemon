@@ -1,0 +1,24 @@
+sync_state.json
+__pycache__/
+*.pyc
+.env
+.venv/
+dist/
+
+# Data files - never commit or package these
+*.json
+!pyproject.toml
+!**/evals.json
+!**/eval_metadata.json
+skills/
+.claude/settings.local.json
+.playwright-mcp/
+exported_events.json
+sampled_sessions.json
+session_ids.json
+session_start_ids.json
+session_topics.json
+trajectory_summaries.json
+eval_*.json
+eval_results_*.json
+update_event_api.txt

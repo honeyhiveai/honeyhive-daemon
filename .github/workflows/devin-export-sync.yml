@@ -1,0 +1,101 @@
+name: Devin Export - Sync Sessions to HoneyHive
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "devin/**"
+      - ".github/workflows/devin-export-sync.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "devin/**"
+      - ".github/workflows/devin-export-sync.yml"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode: oneshot or daemon"
+        required: false
+        default: "oneshot"
+        type: choice
+        options:
+          - oneshot
+          - daemon
+      interval:
+        description: "Polling interval in seconds (daemon mode only)"
+        required: false
+        default: "60"
+        type: string
+      verbose:
+        description: "Enable verbose logging"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r devin/requirements.txt
+
+      - name: Check required secrets
+        id: check-secrets
+        env:
+          HAS_DEVIN_KEY: ${{ secrets.DEVIN_API_KEY != '' }}
+          HAS_HH_KEY: ${{ secrets.HH_API_KEY != '' }}
+          HAS_HH_URL: ${{ secrets.HH_API_URL != '' }}
+          HAS_HH_PROJECT: ${{ secrets.HH_PROJECT != '' }}
+        run: |
+          if [[ "$HAS_DEVIN_KEY" != "true" || "$HAS_HH_KEY" != "true" || "$HAS_HH_URL" != "true" || "$HAS_HH_PROJECT" != "true" ]]; then
+            echo "Missing required secrets. Ensure DEVIN_API_KEY, HH_API_KEY, HH_API_URL, and HH_PROJECT are set."
+            echo "skipping=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "All required secrets are present."
+            echo "skipping=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Devin to HoneyHive sync
+        if: steps.check-secrets.outputs.skipping == 'false'
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          DEVIN_ORG_ID: ${{ secrets.DEVIN_ORG_ID }}
+          HH_API_KEY: ${{ secrets.HH_API_KEY }}
+          HH_API_URL: ${{ secrets.HH_API_URL }}
+          HH_PROJECT: ${{ secrets.HH_PROJECT }}
+          STATE_FILE_PATH: /tmp/sync_state.json
+        run: |
+          VERBOSE_FLAG=""
+          if [[ "${{ github.event.inputs.verbose }}" == "true" ]]; then
+            VERBOSE_FLAG="--verbose"
+          fi
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "Running one-shot sync (PR trigger)"
+            python devin/devin_to_honeyhive.py $VERBOSE_FLAG
+          elif [[ "${{ github.event.inputs.mode }}" == "daemon" ]]; then
+            echo "Running daemon mode (interval=${{ github.event.inputs.interval }}s)"
+            timeout 540 python devin/devin_to_honeyhive.py \
+              --daemon \
+              --interval ${{ github.event.inputs.interval }} \
+              $VERBOSE_FLAG || true
+          else
+            echo "Running one-shot sync"
+            python devin/devin_to_honeyhive.py $VERBOSE_FLAG
+          fi

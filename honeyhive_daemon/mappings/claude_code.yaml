@@ -1,0 +1,616 @@
+version: 2
+
+hook_registrations:
+  - hook_event_name: SessionStart
+  - hook_event_name: InstructionsLoaded
+  - hook_event_name: UserPromptSubmit
+  - hook_event_name: PreToolUse
+  - hook_event_name: PermissionRequest
+  - hook_event_name: PostToolUse
+  - hook_event_name: PostToolUseFailure
+  - hook_event_name: Notification
+  - hook_event_name: Stop
+  - hook_event_name: SubagentStart
+  - hook_event_name: SubagentStop
+  - hook_event_name: PreCompact
+  - hook_event_name: SessionEnd
+  - hook_event_name: TeammateIdle
+  - hook_event_name: TaskCompleted
+  - hook_event_name: ConfigChange
+  - hook_event_name: WorktreeCreate
+  - hook_event_name: WorktreeRemove
+
+common_metadata:
+  static:
+    agent.provider: anthropic
+    agent.product: claude-code
+    capture.source: claude_hook
+    raw.format: claude_hook_json
+  from_payload:
+    agent.session_id: session_id
+    transcript.path: transcript_path
+    cwd: cwd
+
+derived_metadata:
+  repo.path: repo_root
+  git.revision: git_revision
+
+tool_templates:
+  bash_pre:
+    event_type: tool
+    event_name: tool.bash
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: bash
+        tool.phase: pre
+      from_payload:
+        tool.name: tool_name
+        tool.command: tool_input.command
+    inputs:
+      from_payload:
+        tool_input: tool_input
+
+  bash_permission:
+    event_type: tool
+    event_name: tool.bash
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: bash
+        tool.phase: permission
+      from_payload:
+        tool.name: tool_name
+        tool.command: tool_input.command
+    inputs:
+      from_payload:
+        tool_input: tool_input
+
+  bash_post:
+    event_type: tool
+    event_name: tool.bash
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: bash
+        tool.phase: post
+        tool.status: success
+      from_payload:
+        tool.name: tool_name
+        tool.command: tool_input.command
+    inputs:
+      from_payload:
+        tool_input: tool_input
+    outputs:
+      from_payload:
+        tool_response: tool_response
+
+  bash_failure:
+    event_type: tool
+    event_name: tool.bash
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: bash
+        tool.phase: post
+        tool.status: failure
+      from_payload:
+        tool.name: tool_name
+        tool.command: tool_input.command
+    inputs:
+      from_payload:
+        tool_input: tool_input
+    outputs:
+      from_payload:
+        tool_response: tool_response
+
+  file_read:
+    event_type: tool
+    event_name: tool.file_read
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: file
+      from_payload:
+        tool.name: tool_name
+        file.path: tool_input.file_path
+    inputs:
+      from_payload:
+        tool_input: tool_input
+    outputs:
+      from_payload:
+        tool_response: tool_response
+
+  file_edit_pre:
+    event_type: tool
+    event_name: tool.file_edit
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: file
+        tool.phase: pre
+        file.operation: edit
+      from_payload:
+        tool.name: tool_name
+        file.path: tool_input.file_path
+    inputs:
+      from_payload:
+        tool_input: tool_input
+
+  file_edit_permission:
+    event_type: tool
+    event_name: tool.file_edit
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: file
+        tool.phase: permission
+        file.operation: edit
+      from_payload:
+        tool.name: tool_name
+        file.path: tool_input.file_path
+    inputs:
+      from_payload:
+        tool_input: tool_input
+
+  file_edit_post:
+    event_type: tool
+    event_name: tool.file_edit
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: file
+        tool.phase: post
+        tool.status: success
+        file.operation: edit
+      from_payload:
+        tool.name: tool_name
+        file.path: tool_input.file_path
+    inputs:
+      from_payload:
+        tool_input: tool_input
+    outputs:
+      from_payload:
+        tool_response: tool_response
+
+  file_edit_failure:
+    event_type: tool
+    event_name: tool.file_edit
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: file
+        tool.phase: post
+        tool.status: failure
+        file.operation: edit
+      from_payload:
+        tool.name: tool_name
+        file.path: tool_input.file_path
+    inputs:
+      from_payload:
+        tool_input: tool_input
+    outputs:
+      from_payload:
+        tool_response: tool_response
+
+  file_create_post:
+    event_type: tool
+    event_name: tool.file_create
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: file
+        tool.phase: post
+        tool.status: success
+        file.operation: create
+      from_payload:
+        tool.name: tool_name
+        file.path: tool_input.file_path
+    inputs:
+      from_payload:
+        tool_input: tool_input
+    outputs:
+      from_payload:
+        tool_response: tool_response
+
+  file_write_pre:
+    event_type: tool
+    event_name: tool.file_write
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: file
+        tool.phase: pre
+        file.operation: write
+      from_payload:
+        tool.name: tool_name
+        file.path: tool_input.file_path
+    inputs:
+      from_payload:
+        tool_input: tool_input
+
+  file_write_permission:
+    event_type: tool
+    event_name: tool.file_write
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: file
+        tool.phase: permission
+        file.operation: write
+      from_payload:
+        tool.name: tool_name
+        file.path: tool_input.file_path
+    inputs:
+      from_payload:
+        tool_input: tool_input
+
+  file_write_post:
+    event_type: tool
+    event_name: tool.file_write
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: file
+        tool.phase: post
+        tool.status: success
+        file.operation: write
+      from_payload:
+        tool.name: tool_name
+        file.path: tool_input.file_path
+    inputs:
+      from_payload:
+        tool_input: tool_input
+    outputs:
+      from_payload:
+        tool_response: tool_response
+
+  file_write_failure:
+    event_type: tool
+    event_name: tool.file_write
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: file
+        tool.phase: post
+        tool.status: failure
+        file.operation: write
+      from_payload:
+        tool.name: tool_name
+        file.path: tool_input.file_path
+    inputs:
+      from_payload:
+        tool_input: tool_input
+    outputs:
+      from_payload:
+        tool_response: tool_response
+
+  web_search:
+    event_type: tool
+    event_name: tool.web_search
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: web
+      from_payload:
+        tool.name: tool_name
+    inputs:
+      from_payload:
+        tool_input: tool_input
+    outputs:
+      from_payload:
+        tool_response: tool_response
+
+  file_search:
+    event_type: tool
+    event_name: tool.file_search
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: file
+      from_payload:
+        tool.name: tool_name
+    inputs:
+      from_payload:
+        tool_input: tool_input
+    outputs:
+      from_payload:
+        tool_response: tool_response
+
+  agent_tool:
+    event_type: tool
+    event_name: tool.agent
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: agent
+      from_payload:
+        tool.name: tool_name
+    inputs:
+      from_payload:
+        tool_input: tool_input
+    outputs:
+      from_payload:
+        tool_response: tool_response
+
+  generic_tool:
+    event_type: tool
+    event_name: tool.call
+    event_name_template: "tool.{tool_name}"
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        tool.kind: generic
+      from_payload:
+        tool.name: tool_name
+    inputs:
+      from_payload:
+        tool_input: tool_input
+    outputs:
+      from_payload:
+        tool_response: tool_response
+
+event_mappings:
+  SessionStart:
+    event_type: session
+    event_name: session.start
+    event_id_strategy: session_id
+    parent_id_strategy: none
+    metadata:
+      from_payload:
+        model.name: model
+        session.source: source
+
+  InstructionsLoaded:
+    event_type: chain
+    event_name: chain.instructions.loaded
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      from_payload:
+        file.path: file_path
+        instructions.load_reason: load_reason
+        instructions.memory_type: memory_type
+        instructions.trigger_file_path: trigger_file_path
+    inputs:
+      from_payload:
+        globs: globs
+
+  UserPromptSubmit:
+    event_type: model
+    event_name: turn.user
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    outputs:
+      static:
+        role: user
+      from_payload:
+        content: prompt
+    metadata:
+      static:
+        turn.role: user
+
+  PreToolUse:
+    discriminator: tool_name
+    mappings:
+      Bash: $ref:bash_pre
+      Edit: $ref:file_edit_pre
+      Write: $ref:file_write_pre
+      Read: $ref:file_read
+      LS: $ref:file_search
+      Glob: $ref:file_search
+      Grep: $ref:file_search
+      WebSearch: $ref:web_search
+      WebFetch: $ref:web_search
+      Agent: $ref:agent_tool
+    default: $ref:generic_tool
+
+  PermissionRequest:
+    discriminator: tool_name
+    mappings:
+      Bash: $ref:bash_permission
+      Edit: $ref:file_edit_permission
+      Write: $ref:file_write_permission
+      Read: $ref:file_read
+      LS: $ref:file_search
+      Glob: $ref:file_search
+      Grep: $ref:file_search
+      WebSearch: $ref:web_search
+      WebFetch: $ref:web_search
+      Agent: $ref:agent_tool
+    default: $ref:generic_tool
+
+  PostToolUse:
+    discriminator: tool_name
+    mappings:
+      Bash: $ref:bash_post
+      Edit: $ref:file_edit_post
+      Read: $ref:file_read
+      LS: $ref:file_search
+      Glob: $ref:file_search
+      Grep: $ref:file_search
+      WebSearch: $ref:web_search
+      WebFetch: $ref:web_search
+      Agent: $ref:agent_tool
+      Write:
+        discriminator: tool_response.type
+        mappings:
+          create: $ref:file_create_post
+          update: $ref:file_edit_post
+        default: $ref:file_write_post
+    default: $ref:generic_tool
+
+  PostToolUseFailure:
+    discriminator: tool_name
+    mappings:
+      Bash: $ref:bash_failure
+      Edit: $ref:file_edit_failure
+      Write: $ref:file_write_failure
+      Read: $ref:file_read
+      LS: $ref:file_search
+      Glob: $ref:file_search
+      Grep: $ref:file_search
+      WebSearch: $ref:web_search
+      WebFetch: $ref:web_search
+      Agent: $ref:agent_tool
+    default: $ref:generic_tool
+
+  Notification:
+    event_type: chain
+    event_name: chain.notification
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      from_payload:
+        notification.type: notification_type
+        notification.title: title
+    outputs:
+      from_payload:
+        message: message
+
+  Stop:
+    event_type: model
+    event_name: turn.agent
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      static:
+        turn.role: assistant
+    outputs:
+      static:
+        role: assistant
+      from_payload:
+        content: last_assistant_message
+
+  SubagentStart:
+    event_type: chain
+    event_name: chain.subagent.start
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      from_payload:
+        agent.subagent_id: agent_id
+        agent.subagent_type: agent_type
+    inputs:
+      from_payload:
+        task: task
+
+  SubagentStop:
+    event_type: chain
+    event_name: chain.subagent.stop
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      from_payload:
+        agent.subagent_id: agent_id
+        agent.subagent_type: agent_type
+        transcript.path: transcript_path
+    outputs:
+      from_payload:
+        message: last_assistant_message
+
+  PreCompact:
+    event_type: chain
+    event_name: chain.pre_compact
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      from_payload:
+        compact.trigger: trigger
+    inputs:
+      from_payload:
+        custom_instructions: custom_instructions
+
+  SessionEnd:
+    event_type: chain
+    event_name: session.end
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      from_payload:
+        session.end_reason: reason
+
+  TeammateIdle:
+    event_type: chain
+    event_name: chain.teammate.idle
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      from_payload:
+        teammate.name: teammate_name
+        team.name: team_name
+
+  TaskCompleted:
+    event_type: chain
+    event_name: chain.task.completed
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      from_payload:
+        task.subject: subject
+        task.description: description
+        teammate.name: teammate_name
+        team.name: team_name
+
+  ConfigChange:
+    event_type: chain
+    event_name: chain.config.change
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      from_payload:
+        config.source: source
+        file.path: file_path
+
+  WorktreeCreate:
+    event_type: chain
+    event_name: chain.worktree.create
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      from_payload:
+        worktree.name: name
+
+  WorktreeRemove:
+    event_type: chain
+    event_name: chain.worktree.remove
+    event_id_strategy: uuid4
+    parent_id_strategy: session_root
+    metadata:
+      from_payload:
+        worktree.path: worktree_path
