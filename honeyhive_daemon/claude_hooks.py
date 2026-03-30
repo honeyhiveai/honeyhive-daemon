@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -114,6 +115,16 @@ def normalize_claude_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]
         repo_root=repo_root,
         git_revision=git_revision,
     )
+
+    # Extract session name from transcript or payload and add to metadata
+    session_name = payload.get("session_name")
+    if not session_name:
+        transcript_path = payload.get("transcript_path")
+        if transcript_path:
+            session_name = _read_session_name_from_transcript(transcript_path)
+    if session_name:
+        metadata["session_name"] = session_name
+
     # Resolve dynamic event name template if present
     event_name_template = event_mapping.get("event_name_template")
     if event_name_template:
@@ -146,6 +157,31 @@ def normalize_claude_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]
             event["_hook_failure"] = True
 
     return event
+
+
+@lru_cache(maxsize=256)
+def _read_session_name_from_transcript(transcript_path: str) -> Optional[str]:
+    """Read the session name from the first line of a Claude Code transcript.
+
+    Claude Code writes a ``{"type": "custom-title", "customTitle": "..."}``
+    record as the very first line of the transcript JSONL before any hooks fire,
+    so it is available by the time SessionStart is processed.  The result is
+    cached per transcript path so repeated calls (one per hook event) are cheap.
+    """
+    try:
+        path = Path(transcript_path)
+        if not path.exists() or not path.is_file():
+            return None
+        with path.open(encoding="utf-8") as fh:
+            first_line = fh.readline().strip()
+        if not first_line:
+            return None
+        record = json.loads(first_line)
+        if record.get("type") == "custom-title":
+            return record.get("customTitle") or None
+    except (json.JSONDecodeError, OSError):
+        pass
+    return None
 
 
 def _build_metadata(

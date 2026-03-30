@@ -395,6 +395,7 @@ event_mappings:
       from_payload:
         model.name: model
         session.source: source
+        session_name: session_name
 
   InstructionsLoaded:
     event_type: chain
