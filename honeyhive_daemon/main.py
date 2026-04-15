@@ -34,6 +34,14 @@ from .config import (
     save_config,
 )
 from .exporter import export_event, export_events
+from .filters import (
+    FilterVerdict,
+    apply_filters,
+    filter_transcript_content,
+    load_filters,
+    redact_event,
+    save_default_filters,
+)
 from .git_hooks import (
     find_git_root,
     get_commit_link_payload,
@@ -195,6 +203,7 @@ def run(
         ci=ci,
     )
     save_config(config)
+    filters_path = save_default_filters()
 
     hook_command = get_hook_command()
     settings_path = get_claude_settings_path()
@@ -214,6 +223,7 @@ def run(
     _flush_spool(config)
 
     click.echo(f"Daemon home: {get_daemon_home()}")
+    click.echo(f"Filters: {filters_path}")
     click.echo(f"Claude settings: {settings_path}")
     click.echo(f"Project: {resolved_project}")
     if repo_root is not None:
@@ -354,8 +364,28 @@ def ingest_claude_hook() -> None:
         )
         return
 
+    # ── Apply output filters ─────────────────────────────────
+    filters = load_filters()
+    session_name = event.get("metadata", {}).get("session_name")
+    verdict = apply_filters(event, filters, session_name=session_name)
+    if not verdict.should_export:
+        log_message(
+            "filtered out claude event "
+            f"event_name={event.get('event_name')} "
+            f"reason={verdict.reason}"
+        )
+        return
+    if verdict.should_redact:
+        event = redact_event(event)
+        log_message(
+            "redacted claude event "
+            f"event_name={event.get('event_name')} "
+            f"reason={verdict.reason}"
+        )
+
     transcript_path = event.get("metadata", {}).get("transcript.path")
-    record_session_activity(
+    is_session_start = event["event_name"] == "session.start"
+    session_state = record_session_activity(
         str(event["session_id"]),
         transcript_path=str(transcript_path) if transcript_path else None,
         last_activity_ms=int(event["end_time"]),
@@ -363,7 +393,65 @@ def ingest_claude_hook() -> None:
         session_end_event_id=(
             str(event["event_id"]) if event["event_name"] == "session.end" else None
         ),
+        session_start_exported=True if is_session_start else None,
     )
+
+    # ── Synthesize session.start if daemon started after session ──
+    # When the daemon starts mid-session, it misses the SessionStart hook.
+    # Without a session.start event in HoneyHive, artifact updates fail
+    # with 400 and all session data is lost. Create it now.
+    if not is_session_start and not session_state.get("session_start_exported"):
+        synthetic_session = {
+            "event_id": str(event["session_id"]),  # session.start uses session_id as event_id
+            "session_id": str(event["session_id"]),
+            "event_type": "session",
+            "event_name": "session.start",
+            "start_time": int(event["start_time"]),
+            "end_time": int(event["start_time"]),
+            "duration": 0,
+            "inputs": {},
+            "outputs": {},
+            "metadata": {
+                k: v
+                for k, v in event.get("metadata", {}).items()
+                if k
+                in (
+                    "agent.provider",
+                    "agent.product",
+                    "capture.source",
+                    "raw.format",
+                    "agent.session_id",
+                    "session_name",
+                    "transcript.path",
+                    "cwd",
+                    "repo.path",
+                    "git.revision",
+                    "model.name",
+                )
+            },
+        }
+        synthetic_session["metadata"]["synthetic"] = True
+        session_name = synthetic_session["metadata"].get("session_name")
+        if session_name:
+            synthetic_session["session_name"] = session_name
+        try:
+            export_event(config, synthetic_session)
+            record_session_activity(
+                str(event["session_id"]),
+                transcript_path=str(transcript_path) if transcript_path else None,
+                last_activity_ms=int(event["end_time"]),
+                session_start_exported=True,
+            )
+            log_message(
+                "synthesized session.start for mid-session daemon start "
+                f"session_id={event['session_id']} "
+                f"session_name={session_name or '(unknown)'}"
+            )
+        except Exception as exc:
+            log_message(
+                f"failed to synthesize session.start "
+                f"session_id={event['session_id']}: {exc}"
+            )
 
     # Pre+post tool event linking
     hook_phase = event.pop("_hook_phase", None)
@@ -597,6 +685,20 @@ def _push_pending_session_artifacts(
                 f"because transcript could not be read"
             )
             continue
+
+        # Apply content filters to transcript before push
+        artifact_filters = load_filters()
+        original_count = len(transcript_content)
+        transcript_content = filter_transcript_content(
+            transcript_content, artifact_filters
+        )
+        if len(transcript_content) != original_count:
+            log_message(
+                "filtered transcript content "
+                f"session_id={session['session_id']} "
+                f"before={original_count} after={len(transcript_content)}"
+            )
+
         reason = "session_end" if session.get("ended") else "idle_timeout"
         artifact_outputs = {
             "artifact": {
