@@ -87,6 +87,8 @@ def record_session_activity(
     ended: bool = False,
     session_end_event_id: str | None = None,
     session_start_exported: bool | None = None,
+    cwd: str | None = None,
+    session_name: str | None = None,
 ) -> Dict[str, Any]:
     """Update local state for one Claude session."""
     index = load_session_index()
@@ -97,6 +99,10 @@ def record_session_activity(
     session["last_activity_ms"] = last_activity_ms
     if transcript_path:
         session["transcript_path"] = transcript_path
+    if cwd:
+        session["cwd"] = cwd
+    if session_name:
+        session["session_name"] = session_name
     if ended:
         session["ended"] = True
         # Reset artifact_pushed so the background loop re-uploads the

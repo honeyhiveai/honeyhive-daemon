@@ -27,11 +27,16 @@ from .transcript import (
 from .config import (
     DEFAULT_BASE_URL,
     DaemonConfig,
+    _get_user_config_path,
     get_claude_settings_path,
     get_daemon_home,
     get_pid_path,
     load_config,
+    load_user_config,
+    resolve_config,
+    resolve_config_for_cwd,
     save_config,
+    save_user_config,
 )
 from .exporter import export_event, export_events
 from .filters import (
@@ -163,8 +168,9 @@ def cli() -> None:
     "--key",
     "api_key",
     envvar="HH_API_KEY",
-    required=True,
-    help="HoneyHive API key.",
+    required=False,
+    default=None,
+    help="HoneyHive API key (deprecated — use 'honeyhive-daemon init').",
 )
 @click.option(
     "--url",
@@ -177,7 +183,8 @@ def cli() -> None:
 @click.option(
     "--project",
     envvar="HH_PROJECT",
-    help="Optional HoneyHive project override.",
+    default=None,
+    help="HoneyHive project override (deprecated — use 'honeyhive-daemon init').",
 )
 @click.option(
     "--repo",
@@ -185,8 +192,10 @@ def cli() -> None:
     help="Repo to attach git commit events to.",
 )
 @click.option("--ci", is_flag=True, help="Enable CI mode.")
+@click.pass_context
 def run(
-    api_key: str,
+    ctx: click.Context,
+    api_key: Optional[str],
     base_url: str,
     project: Optional[str],
     repo: Optional[Path],
@@ -194,7 +203,87 @@ def run(
 ) -> None:
     """Install Claude hooks, persist config, and keep retrying queued events."""
     repo_root = _resolve_repo(repo)
+
+    # --- Detect explicit CLI flags vs env-var / default sourcing -----------
+    # Click resolves envvar-backed options transparently, so we check
+    # whether the value actually came from the command line by inspecting
+    # the original source.  ``ctx.get_parameter_source`` returns
+    # ``ParameterSource.COMMANDLINE`` only when the user typed the flag.
+    key_from_cli = (
+        ctx.get_parameter_source("api_key") == click.core.ParameterSource.COMMANDLINE
+    )
+    project_from_cli = (
+        ctx.get_parameter_source("project") == click.core.ParameterSource.COMMANDLINE
+    )
+
+    if key_from_cli:
+        click.echo(
+            "Warning: --key is deprecated. "
+            "Use 'honeyhive-daemon init' to set up per-project config."
+        )
+    if project_from_cli:
+        click.echo(
+            "Warning: --project is deprecated. "
+            "Use 'honeyhive-daemon init' to set up per-project config."
+        )
+
+    # --- Migrate CLI-provided key to user-level config --------------------
+    if api_key and key_from_cli:
+        user_data: dict = {"api_key_env": "HH_API_KEY"}
+        # If HH_API_KEY is not set, store the raw key as a last-resort fallback
+        if not os.getenv("HH_API_KEY"):
+            user_data["api_key"] = api_key
+        save_user_config(user_data)
+        click.echo(
+            f"Saved API key config to {_get_user_config_path()} "
+            "(future runs won't need --key)."
+        )
+
+    # --- Fallback chain for api_key ---------------------------------------
+    # Priority:
+    #   1. --key / $HH_API_KEY (if provided)
+    #   2. ~/.honeyhive/config.json (user-level)
+    #   3. ~/.honeyhive/daemon/state/config.json (legacy)
+    #   4. Error with helpful message
+    if not api_key:
+        # Try user-level config
+        user_cfg = load_user_config()
+        api_key = user_cfg.get("api_key")  # raw key fallback
+        if not api_key:
+            api_key_env = user_cfg.get("api_key_env")
+            if api_key_env:
+                api_key = os.getenv(api_key_env)
+
+    if not api_key:
+        # Try legacy daemon config
+        legacy = load_config()
+        if legacy and legacy.api_key:
+            api_key = legacy.api_key
+            if not project:
+                project = legacy.project
+
+    if not api_key:
+        click.echo(
+            "Error: No API key found.\n\n"
+            "Provide one of:\n"
+            "  1. Run 'honeyhive-daemon init' in your project directory\n"
+            "  2. Set the HH_API_KEY environment variable\n"
+            "  3. Pass --key (deprecated)"
+        )
+        raise SystemExit(1)
+
+    # --- Fallback chain for project ---------------------------------------
+    if not project:
+        user_cfg = load_user_config()
+        project = user_cfg.get("project")
+
+    if not project:
+        legacy = load_config()
+        if legacy and legacy.project:
+            project = legacy.project
+
     resolved_project = project or _derive_project_name(repo_root)
+
     config = DaemonConfig(
         api_key=api_key,
         base_url=base_url,
@@ -268,6 +357,56 @@ def run(
     finally:
         if pid_path.exists():
             pid_path.unlink()
+
+
+@cli.command()
+@click.option("--project", "-p", required=True, help="HoneyHive project name")
+@click.option("--api-key-env", default="HH_API_KEY", help="Env var holding the API key")
+def init(project: str, api_key_env: str) -> None:
+    """Initialize .honeyhive/ config in the current directory."""
+    cwd = Path.cwd()
+    hh_dir = cwd / ".honeyhive"
+
+    if hh_dir.exists():
+        click.echo(f"Warning: {hh_dir} already exists — updating files.")
+
+    hh_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write project config
+    project_config_path = hh_dir / "config.json"
+    project_config_path.write_text(
+        json.dumps({"project": project}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    # Write local config (not committed)
+    local_config_path = hh_dir / "config.local.json"
+    local_config_path.write_text(
+        json.dumps({"api_key_env": api_key_env}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    # Auto-append to .gitignore
+    gitignore_path = cwd / ".gitignore"
+    local_pattern = ".honeyhive/config.local.json"
+    if gitignore_path.exists():
+        existing = gitignore_path.read_text(encoding="utf-8")
+        lines = existing.splitlines()
+        if local_pattern not in lines:
+            # Ensure trailing newline before appending
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            gitignore_path.write_text(
+                existing + local_pattern + "\n",
+                encoding="utf-8",
+            )
+    else:
+        gitignore_path.write_text(local_pattern + "\n", encoding="utf-8")
+
+    click.echo(f"Created {hh_dir}/")
+    click.echo(f"  config.json        → project: {project}")
+    click.echo(f"  config.local.json  → api_key_env: {api_key_env}")
+    click.echo(f"Updated {gitignore_path}")
 
 
 @cli.command()
@@ -383,6 +522,15 @@ def ingest_claude_hook() -> None:
             f"reason={verdict.reason}"
         )
 
+    # ── Route to correct project/key based on cwd ─────────────
+    event_cwd = event.get("metadata", {}).get("cwd")
+    cli_config = config  # preserve CLI-set defaults for hierarchical resolution
+    config = resolve_config(
+        cwd=event_cwd,
+        session_name=session_name,
+        cli_defaults=cli_config,
+    )
+
     transcript_path = event.get("metadata", {}).get("transcript.path")
     is_session_start = event["event_name"] == "session.start"
     session_state = record_session_activity(
@@ -394,6 +542,8 @@ def ingest_claude_hook() -> None:
             str(event["event_id"]) if event["event_name"] == "session.end" else None
         ),
         session_start_exported=True if is_session_start else None,
+        cwd=event_cwd,
+        session_name=session_name,
     )
 
     # ── Synthesize session.start if daemon started after session ──
@@ -512,6 +662,7 @@ def ingest_claude_hook() -> None:
         # (every 5s) rather than inline here, to avoid hook timeouts.
     except Exception as exc:  # pragma: no cover
         event["spool_reason"] = str(exc)
+        event["_resolved_config"] = config.to_dict()
         append_spool_event(event)
         log_message(f"spooled claude event {event['event_name']}: {exc}")
 
@@ -616,14 +767,23 @@ def _flush_expired_tool_events(config: DaemonConfig) -> None:
         event.get("metadata", {}).setdefault("tool.phase", "pre")
         event.pop("_hook_phase", None)
         event.pop("_hook_failure", None)
+        # Resolve per-event config from cwd/session_name, fall back to global
+        event_cwd = event.get("metadata", {}).get("cwd")
+        event_session_name = event.get("metadata", {}).get("session_name")
+        event_config = resolve_config(
+            cwd=event_cwd,
+            session_name=event_session_name,
+            cli_defaults=config,
+        ) if event_cwd or event_session_name else config
         try:
-            export_event(config, event)
+            export_event(event_config, event)
             log_message(
                 "exported orphaned pre-phase tool event "
                 f"event_name={event['event_name']}"
             )
         except Exception as exc:
             event["spool_reason"] = str(exc)
+            event["_resolved_config"] = event_config.to_dict()
             append_spool_event(event)
             log_message(f"spooled orphaned tool event: {exc}")
 
@@ -652,13 +812,22 @@ def _flush_spool(config: DaemonConfig) -> None:
     if not pending:
         return
     log_message(f"flushing spool event_count={len(pending)}")
-    try:
-        export_events(config, pending)
-    except Exception as exc:
-        log_message(f"flush failed: {exc}")
-        return
-    replace_spool_events([])
-    log_message("flush succeeded")
+    failed: list = []
+    for event in pending:
+        # Use per-event resolved config if stamped, otherwise fall back to global
+        stamped = event.pop("_resolved_config", None)
+        event_config = DaemonConfig.from_dict(stamped) if stamped else config
+        try:
+            export_event(event_config, event)
+        except Exception as exc:
+            log_message(f"flush event failed: {exc}")
+            event["spool_reason"] = str(exc)
+            if stamped:
+                event["_resolved_config"] = stamped
+            failed.append(event)
+    replace_spool_events(failed)
+    flushed = len(pending) - len(failed)
+    log_message(f"flush complete flushed={flushed} remaining={len(failed)}")
 
 
 def _push_pending_session_artifacts(
@@ -677,6 +846,14 @@ def _push_pending_session_artifacts(
         transcript_path = session.get("transcript_path")
         if not transcript_path:
             continue
+        # Resolve per-session config from stored cwd/session_name
+        session_cwd = session.get("cwd")
+        sess_name = session.get("session_name")
+        session_config = resolve_config(
+            cwd=session_cwd,
+            session_name=sess_name,
+            cli_defaults=config,
+        ) if session_cwd or sess_name else config
         transcript_content = _read_transcript_jsonl(transcript_path)
         if transcript_content is None:
             log_message(
@@ -726,14 +903,14 @@ def _push_pending_session_artifacts(
                     # session.start root event — only chat history
                     if session_root_outputs:
                         update_event_outputs(
-                            config,
+                            session_config,
                             event_id=event_id,
                             outputs=session_root_outputs,
                         )
                 else:
                     # session.end event — full artifact transcript
                     update_event_outputs(
-                        config,
+                        session_config,
                         event_id=event_id,
                         outputs=artifact_outputs,
                     )
@@ -742,7 +919,7 @@ def _push_pending_session_artifacts(
             if session_metrics:
                 try:
                     update_event(
-                        config,
+                        session_config,
                         event_id=str(session["event_id"]),
                         metrics=session_metrics,
                     )
