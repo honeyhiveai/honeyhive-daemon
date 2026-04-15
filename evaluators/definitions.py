@@ -294,6 +294,99 @@ Your rating: [[X]]"""
 
 
 # ---------------------------------------------------------------------------
+# 9. Waggle Skill Success — did the skill session complete without errors?
+# ---------------------------------------------------------------------------
+# Checks sessions named "waggle-*" for completion signals:
+# - Has a session.end event (clean exit)
+# - No errors in tool results
+# - Not stuck (event count within bounds)
+# - Produced output (non-empty outputs on session.end artifact)
+
+CRITERIA_WAGGLE_SKILL_SUCCESS = _TOOL_NORMALIZER + """
+def evaluate(event):
+    records = _extract_events_from_artifact(event)
+    if not records:
+        return 0.0
+
+    # Check for session metadata
+    metadata = event.get("metadata") or {}
+    session_name = metadata.get("session.name", "") or ""
+
+    has_session_end = False
+    error_count = 0
+    total_events = len(records)
+    tool_errors = 0
+    total_tools = 0
+
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        etype = r.get("type", "")
+        ename = r.get("event_name", "")
+        hook = r.get("hook_event_name", "")
+
+        # Check for clean session end
+        if ename == "session.end" or hook == "Stop":
+            has_session_end = True
+
+        # Count tool errors
+        if etype == "tool_result":
+            total_tools += 1
+            if r.get("is_error"):
+                tool_errors += 1
+        elif etype == "tool_use":
+            total_tools += 1
+
+    # Scoring: 0.0 to 1.0
+    score = 0.0
+
+    # Clean exit: 0.4 points
+    if has_session_end:
+        score += 0.4
+
+    # Low error rate: 0.3 points
+    if total_tools > 0:
+        error_rate = tool_errors / total_tools
+        if error_rate == 0:
+            score += 0.3
+        elif error_rate < 0.1:
+            score += 0.2
+        elif error_rate < 0.3:
+            score += 0.1
+    else:
+        # No tools used — might be fine for some skills
+        score += 0.15
+
+    # Reasonable session size: 0.3 points
+    # Too short (<3 events) = probably failed to start
+    # Too long (>500 events) = probably stuck
+    if 3 <= total_events <= 500:
+        score += 0.3
+    elif total_events > 500:
+        score += 0.1  # did work but may be stuck
+
+    return round(score, 2)
+"""
+
+# ---------------------------------------------------------------------------
+# 10. Waggle Skill Duration — how long did the skill session take?
+# ---------------------------------------------------------------------------
+
+CRITERIA_WAGGLE_SKILL_DURATION = """
+def evaluate(event):
+    start = event.get("start_time") or 0
+    end = event.get("end_time") or 0
+    if isinstance(start, str):
+        from datetime import datetime
+        start = int(datetime.fromisoformat(start.replace("Z", "+00:00")).timestamp() * 1000)
+    if isinstance(end, str):
+        from datetime import datetime
+        end = int(datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp() * 1000)
+    duration_s = (end - start) / 1000.0
+    return round(max(0, duration_s), 1)
+"""
+
+# ---------------------------------------------------------------------------
 # Registry: all evaluator definitions for programmatic creation
 # ---------------------------------------------------------------------------
 
@@ -438,6 +531,38 @@ EVALUATORS = [
         "model_name": "claude-sonnet-4-20250514",
         "enabled_in_prod": False,
         "sampling_percentage": 20,
+        "filters": {
+            "filterArray": [
+                {"field": "event_type", "operator": "is", "value": "chain", "type": "string"},
+                {"field": "event_name", "operator": "is", "value": "session.end", "type": "string"},
+            ]
+        },
+    },
+    {
+        "name": "Waggle Skill - Success Rate",
+        "description": "Composite score (0-1) measuring whether a waggle skill session completed successfully: clean exit, low error rate, reasonable session size. Runs on waggle-* sessions only.",
+        "type": "PYTHON",
+        "criteria": CRITERIA_WAGGLE_SKILL_SUCCESS,
+        "return_type": "float",
+        "scale": 1,
+        "threshold": {"min": 0.7, "max": 1.0, },
+        "enabled_in_prod": True,
+        "filters": {
+            "filterArray": [
+                {"field": "event_type", "operator": "is", "value": "chain", "type": "string"},
+                {"field": "event_name", "operator": "is", "value": "session.end", "type": "string"},
+            ]
+        },
+    },
+    {
+        "name": "Waggle Skill - Duration",
+        "description": "Session duration in seconds. Tracks how long each waggle skill takes to run, useful for identifying slow or stuck skills.",
+        "type": "PYTHON",
+        "criteria": CRITERIA_WAGGLE_SKILL_DURATION,
+        "return_type": "float",
+        "scale": 3600,
+        "threshold": {"min": 1, "max": 600, },
+        "enabled_in_prod": True,
         "filters": {
             "filterArray": [
                 {"field": "event_type", "operator": "is", "value": "chain", "type": "string"},

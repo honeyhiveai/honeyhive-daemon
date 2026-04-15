@@ -82,6 +82,28 @@ def _get_events_endpoint(base_url: str) -> str:
     return f"{base_url}/events"
 
 
+def _load_session_config(session_name: Optional[str]) -> Dict[str, Any]:
+    """Load session-level config from sidecar file if it exists.
+
+    Checks ``~/.honeyhive/daemon/sessions/{session_name}.json`` for a
+    ``config`` dict to attach to every event for this session.
+    """
+    if not session_name:
+        return {}
+    from .config import get_daemon_home
+
+    path = get_daemon_home() / "sessions" / f"{session_name}.json"
+    if not path.exists():
+        return {}
+    try:
+        import json as _json
+
+        data = _json.loads(path.read_text(encoding="utf-8"))
+        return dict(data.get("config", {}))
+    except Exception:
+        return {}
+
+
 def _build_event_payload(
     config: DaemonConfig, event: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -99,6 +121,13 @@ def _build_event_payload(
             metadata["raw_post"] = raw_post
     elif raw_payload is not None:
         metadata["raw"] = raw_payload
+
+    # Load session-level config from sidecar file
+    session_name = metadata.get("session_name")
+    session_config = _load_session_config(session_name)
+    event_config = dict(event.get("config", {}))
+    event_config.update(session_config)
+
     event_payload: Dict[str, Any] = {
         "project": config.project,
         "event_id": str(event["event_id"]),
@@ -114,9 +143,10 @@ def _build_event_payload(
         "metadata": metadata,
         "children_ids": [],
     }
+    if event_config:
+        event_payload["config"] = event_config
     # Promote session_name from metadata to top-level field on session events
     # so HoneyHive indexes it as a first-class session attribute.
-    session_name = metadata.get("session_name")
     if session_name and event.get("event_type") == "session":
         event_payload["session_name"] = str(session_name)
     if event.get("error"):
