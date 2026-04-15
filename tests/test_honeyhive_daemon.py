@@ -67,6 +67,90 @@ def test_normalize_claude_session_start() -> None:
     assert event["metadata"]["agent.product"] == "claude-code"
 
 
+def test_normalize_claude_session_start_with_transcript_session_name(
+    tmp_path: Path,
+) -> None:
+    """Session name is extracted from the transcript's custom-title line."""
+    from honeyhive_daemon.claude_hooks import _read_session_name_from_transcript
+
+    # Clear the LRU cache so our tmp file is read fresh
+    _read_session_name_from_transcript.cache_clear()
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "custom-title",
+                "customTitle": "waggle-focus-watcher",
+                "sessionId": "sess-name-1",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    event = normalize_claude_payload(
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-name-1",
+            "cwd": "/tmp/demo",
+            "transcript_path": str(transcript),
+        }
+    )
+
+    assert event is not None
+    assert event["metadata"]["session_name"] == "waggle-focus-watcher"
+
+
+def test_normalize_claude_session_name_from_payload() -> None:
+    """If session_name is in the hook payload, prefer it over transcript."""
+    event = normalize_claude_payload(
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-name-2",
+            "cwd": "/tmp/demo",
+            "session_name": "my-named-session",
+        }
+    )
+
+    assert event is not None
+    assert event["metadata"]["session_name"] == "my-named-session"
+
+
+def test_session_name_propagated_to_all_events(tmp_path: Path) -> None:
+    """Session name appears in metadata for non-session events too."""
+    from honeyhive_daemon.claude_hooks import _read_session_name_from_transcript
+
+    _read_session_name_from_transcript.cache_clear()
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "custom-title",
+                "customTitle": "my-tool-session",
+                "sessionId": "sess-tool-1",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    event = normalize_claude_payload(
+        {
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-tool-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_response": {"exit_code": 0},
+            "transcript_path": str(transcript),
+        }
+    )
+
+    assert event is not None
+    assert event["metadata"]["session_name"] == "my-tool-session"
+
+
 def test_normalize_claude_bash_tool() -> None:
     event = normalize_claude_payload(
         {
@@ -215,6 +299,87 @@ def test_cli_status_without_config(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert "Configured: no" in result.output
+
+
+def test_export_session_event_includes_session_name(monkeypatch, tmp_path: Path) -> None:
+    """session_name is promoted to a top-level field on session events."""
+    captured = {}
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+
+    class FakeEventsAPI:
+        def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
+            captured["event"] = request.event
+
+    class FakeHoneyHive:
+        def __init__(self, api_key: str, base_url: str) -> None:
+            self.events = FakeEventsAPI()
+
+    monkeypatch.setattr("honeyhive_daemon.exporter.HoneyHive", FakeHoneyHive)
+
+    config = DaemonConfig(
+        api_key="hh_test",
+        base_url="https://api.honeyhive.ai",
+        project="test-project",
+    )
+    event = {
+        "event_id": "sess-1",
+        "session_id": "sess-1",
+        "event_type": "session",
+        "event_name": "session.start",
+        "start_time": 1000,
+        "end_time": 1000,
+        "duration": 0,
+        "metadata": {"session_name": "waggle-focus-watcher"},
+        "inputs": {},
+        "outputs": {},
+    }
+
+    export_event(config, event)
+
+    assert captured["event"]["session_name"] == "waggle-focus-watcher"
+    # Also preserved in metadata
+    assert captured["event"]["metadata"]["session_name"] == "waggle-focus-watcher"
+
+
+def test_export_tool_event_no_session_name_field(monkeypatch, tmp_path: Path) -> None:
+    """session_name is NOT promoted to top-level on non-session events."""
+    captured = {}
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+
+    class FakeEventsAPI:
+        def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
+            captured["event"] = request.event
+
+    class FakeHoneyHive:
+        def __init__(self, api_key: str, base_url: str) -> None:
+            self.events = FakeEventsAPI()
+
+    monkeypatch.setattr("honeyhive_daemon.exporter.HoneyHive", FakeHoneyHive)
+
+    config = DaemonConfig(
+        api_key="hh_test",
+        base_url="https://api.honeyhive.ai",
+        project="test-project",
+    )
+    event = {
+        "event_id": "evt-1",
+        "session_id": "sess-1",
+        "parent_id": "sess-1",
+        "event_type": "tool",
+        "event_name": "tool.Bash",
+        "start_time": 1000,
+        "end_time": 1000,
+        "duration": 0,
+        "metadata": {"session_name": "waggle-focus-watcher"},
+        "inputs": {},
+        "outputs": {},
+    }
+
+    export_event(config, event)
+
+    assert "session_name" not in captured["event"]
+    # But still in metadata for queryability
+    assert captured["event"]["metadata"]["session_name"] == "waggle-focus-watcher"
 
 
 def test_export_event_posts_honeyhive_event(monkeypatch, tmp_path: Path) -> None:

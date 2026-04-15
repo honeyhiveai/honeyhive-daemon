@@ -114,6 +114,11 @@ def _build_event_payload(
         "metadata": metadata,
         "children_ids": [],
     }
+    # Promote session_name from metadata to top-level field on session events
+    # so HoneyHive indexes it as a first-class session attribute.
+    session_name = metadata.get("session_name")
+    if session_name and event.get("event_type") == "session":
+        event_payload["session_name"] = str(session_name)
     if event.get("error"):
         event_payload["error"] = str(event["error"])
     if event.get("metrics"):
