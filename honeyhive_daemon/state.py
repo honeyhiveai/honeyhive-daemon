@@ -86,9 +86,11 @@ def record_session_activity(
     last_activity_ms: int,
     ended: bool = False,
     session_end_event_id: str | None = None,
+    session_start_exported: bool | None = None,
 ) -> Dict[str, Any]:
     """Update local state for one Claude session."""
     index = load_session_index()
+    is_new = session_id not in index
     session = index.get(session_id, {})
     session["session_id"] = session_id
     session["event_id"] = session_id
@@ -102,7 +104,11 @@ def record_session_activity(
         session["artifact_pushed"] = False
     if session_end_event_id:
         session["session_end_event_id"] = session_end_event_id
+    if session_start_exported is not None:
+        session["session_start_exported"] = session_start_exported
+    session.setdefault("session_start_exported", False)
     session.setdefault("artifact_pushed", False)
+    session["_is_new"] = is_new
     index[session_id] = session
     save_session_index(index)
     return session
