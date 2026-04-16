@@ -312,7 +312,7 @@ jobs:
           HH_API_URL: ${{ vars.HH_API_URL }}
         run: |
           honeyhive-daemon push-evaluators \\
-            --project __PROJECT__
+            --project '__PROJECT__'
           # Idempotent — safe to run on every CI pass.
           # Updates the CLAUDE.md adherence evaluator if the file changed.
 
@@ -558,7 +558,7 @@ def analyze_cmd(
 
     click.echo(
         f"Found {len(error_events)} error events across "
-        f"{session_count or '?'} sessions → "
+        f"{'?' if session_count is None else session_count} sessions → "
         f"{len(patterns)} pattern(s), {actionable} actionable (>=3 occurrences).",
         err=True,
     )
@@ -650,8 +650,10 @@ def add_to_ci_cmd(
     # Scaffold per-repo error categories config if it doesn't exist yet.
     from .error_categories import init_config as _init_categories
     root_for_cats = find_project_root(str(cwd)) or str(cwd)
+    # Check existence BEFORE calling init_config — init_config creates the file,
+    # so checking afterwards always returns True (Bug fix: cats_existed was always True).
+    cats_existed = (Path(root_for_cats) / ".honeyhive" / "error-categories.json").exists()
     cats_path = _init_categories(root_for_cats)
-    cats_existed = cats_path.exists() and cats_path.stat().st_size > 0
 
     cron = CADENCES[cadence]
     click.echo("")

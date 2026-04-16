@@ -130,7 +130,10 @@ def load_rules(cwd: Optional[str] = None) -> tuple[list[dict], list[str]]:
     discovered: list[dict] = cfg.get("discovered", [])
 
     if extends == "none":
-        categories = repo_cats
+        # Still include repo-specific discovered entries — they are not defaults,
+        # they are auto-discovered patterns unique to this repo (Bug fix: previously
+        # extends="none" silently dropped all discovered entries).
+        categories = repo_cats + discovered
     else:
         # Defaults first, then repo overrides (more specific rules last loses in first-match,
         # so put repo rules BEFORE defaults to let them override).
