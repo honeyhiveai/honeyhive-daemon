@@ -431,10 +431,13 @@ jobs:
           on Bash to intercept a sentinel exit code and exit 0 silently; a hook
           that auto-fetches before git diff when exit 128 occurs.
 
-          **Script** (scripts/): best when the correct behavior can be encoded
-          once and called by name. Examples: a retry wrapper for rate-limited
-          calls; a setup script that installs a missing tool; a chunker for
-          operations that consistently time out.
+          **Script**: best when the correct behavior can be encoded once and
+          called by name. First, look for an existing scripts directory in the
+          repo (bin/, scripts/, tools/, Makefile, etc.) and place the file
+          there. If none exists, create a bin/ directory or inline the logic
+          as a shell function in an appropriate existing file. Examples: a
+          retry wrapper for rate-limited calls; a setup script that installs
+          a missing tool; a chunker for operations that consistently time out.
 
           **Config** (.claude/settings.json, package.json, etc.): best for
           declarative facts. Examples: adding a command to allowedTools;
@@ -450,7 +453,7 @@ jobs:
           - One fix per PR, minimal change — no refactoring, no extra cleanup
           - PR title: "[HH] <artifact type>: <what it does>"
             e.g. "[HH] hook: intercept git exit 128, auto-fetch origin"
-                 "[HH] script: retry wrapper for rate-limited API calls"
+                 "[HH] helper: retry wrapper for rate-limited API calls"
                  "[HH] doc: auth rotation steps for HubSpot token expiry"
           - PR body: sessions affected, error snippet, what the artifact does
 
