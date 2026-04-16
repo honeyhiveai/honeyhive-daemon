@@ -68,6 +68,19 @@ DEFAULT_CATEGORIES: list[dict] = [
     {"id": "connection_refused", "pattern": "connection refused",      "fix": "Check service availability and add health-check guidance to CLAUDE.md"},
     {"id": "syntax_error",       "pattern": "syntax error",            "fix": "Review code-generation patterns; add examples to CLAUDE.md"},
     {"id": "python_exception",   "pattern": "traceback",               "fix": "Add error handling guidance or a helper script"},
+    # Sentinel exit codes — non-failure signals misread as errors
+    {"id": "exit_code_sentinel", "pattern": "already promoted",        "fix": "Document exit code contract; the script uses non-zero exits as no-op signals, not failures"},
+    {"id": "exit_code_sentinel", "pattern": "already exists",          "fix": "Document exit code contract for idempotent operations"},
+    {"id": "exit_code_sentinel", "pattern": "nothing to do",           "fix": "Document exit code contract; treat this sentinel exit silently"},
+    # Missing env / bad args
+    {"id": "env_var_missing",    "pattern": "unbound variable",        "fix": "Add preflight env-var validation; document required vars in CLAUDE.md with a setup snippet"},
+    {"id": "env_var_missing",    "pattern": "parameter not set",       "fix": "Add preflight env-var validation and a .env.example"},
+    {"id": "arg_mismatch",       "pattern": "usage: ",                 "fix": "Add correct invocation examples to CLAUDE.md"},
+    {"id": "arg_mismatch",       "pattern": "invalid option",          "fix": "Add correct invocation examples to CLAUDE.md"},
+    {"id": "json_parse_error",   "pattern": "parse error",             "fix": "Add jq error handling in bash pipelines"},
+    {"id": "json_parse_error",   "pattern": "invalid json",            "fix": "Add input validation before JSON parsing"},
+    {"id": "deprecated_command", "pattern": "deprecated",              "fix": "Update command references to the replacement"},
+    {"id": "deprecated_command", "pattern": "has been removed",        "fix": "Replace removed command with the current alternative"},
 ]
 
 # Exact lowercased strings (after stripping) that are too generic to be actionable.
@@ -197,8 +210,14 @@ def append_discovered(root: str, entries: list[dict]) -> None:
 # Categorization
 # ---------------------------------------------------------------------------
 
-def categorize(error: str, categories: list[dict], skip_patterns: list[str]) -> tuple[str, str]:
-    """Return (category_id, fix) for an error string, or ('', '') to skip.
+def categorize(error: str, categories: list[dict], skip_patterns: list[str]) -> tuple[str, str, str]:
+    """Return (category_id, fix, fix_tier) for an error string, or ('', '', '') to skip.
+
+    fix_tier is one of: 'hook', 'script', 'config', 'doc'.
+    - 'hook'   → generate a .claude/hooks/ file; zero tokens at runtime
+    - 'script' → generate or update a reusable script in scripts/
+    - 'config' → edit a declarative config file (settings.json, package.json, etc.)
+    - 'doc'    → CLAUDE.md guidance (last resort; explicitly temporary)
 
     Checks skip_patterns first, then iterates categories in order (first match wins).
     Falls back to ``unknown_error`` for non-trivial errors that don't match any rule.
@@ -207,13 +226,17 @@ def categorize(error: str, categories: list[dict], skip_patterns: list[str]) -> 
 
     # Skip exact matches for generic-only content.
     if lower in skip_patterns:
-        return "", ""
+        return "", "", ""
 
     # Try all rules (first match wins).
     for rule in categories:
         pattern = rule.get("pattern", "")
         if pattern and pattern.lower() in lower:
-            return rule["id"], rule.get("fix", "Review the recurring error and add guidance to CLAUDE.md")
+            return (
+                rule["id"],
+                rule.get("fix", "Review the recurring error and add guidance to CLAUDE.md"),
+                rule.get("fix_tier", "doc"),
+            )
 
     # Strip exit-code prefix and check if there's meaningful content left.
     content = lower
@@ -222,6 +245,6 @@ def categorize(error: str, categories: list[dict], skip_patterns: list[str]) -> 
             content = content[len(prefix):]
             break
     if len(content.strip()) < 10:
-        return "", ""
+        return "", "", ""
 
-    return "unknown_error", "Review the recurring error and add guidance to CLAUDE.md"
+    return "unknown_error", "Review the recurring error and add guidance to CLAUDE.md", "doc"

@@ -119,7 +119,7 @@ def _detect_patterns(
         error = _extract_error(ev)
         if not error:
             continue
-        cat_key, fix = categorize(error, categories, skip_patterns)
+        cat_key, fix, _ = categorize(error, categories, skip_patterns)
         if not cat_key:  # filtered as too-generic
             continue
         groups[(cat_key, fix)].append((ev, error))
@@ -146,6 +146,64 @@ def _detect_patterns(
             "confidence": confidence,
             "suggested_fix": fix,
             "example_session_id": session_ids[0] if session_ids else None,
+            "first_seen_ms": min(ts_list) if ts_list else None,
+            "last_seen_ms": max(ts_list) if ts_list else None,
+        })
+
+    return sorted(patterns, key=lambda p: p["occurrences"], reverse=True)
+
+
+def _detect_loop_patterns(error_events: list) -> list:
+    """Find sessions where the same tool fails repeatedly — agent stuck in a retry loop.
+
+    Works on the already-fetched error events so no extra API calls are needed.
+    Surfaces session+tool combos where the same tool errors 5+ times in one session,
+    which indicates the agent is retrying a broken call rather than escalating.
+    """
+    # Group errors by session × tool
+    session_tool: dict = defaultdict(lambda: defaultdict(list))
+    for ev in error_events:
+        sid = ev.get("session_id")
+        tool = (ev.get("event_name") or "unknown").replace("tool.", "")
+        if sid:
+            session_tool[str(sid)][tool].append(ev)
+
+    # Collect (tool, session_id, count) triples where count >= 5
+    loop_cases: dict = defaultdict(list)  # tool → [(sid, count, evts)]
+    for sid, tools in session_tool.items():
+        for tool, evts in tools.items():
+            if len(evts) >= 5:
+                loop_cases[tool].append((sid, len(evts), evts))
+
+    patterns = []
+    for tool, cases in sorted(loop_cases.items(), key=lambda x: -len(x[1])):
+        n_sessions = len(cases)
+        if n_sessions == 0:
+            continue
+        worst_sid, worst_count, worst_evts = max(cases, key=lambda x: x[1])
+        all_evts = [ev for _, _, evts in cases for ev in evts]
+        ts_list = [ev["start_time"] for ev in all_evts if ev.get("start_time")]
+        sample = _extract_error(worst_evts[0])[:200] if worst_evts else ""
+        session_ids = [sid for sid, _, _ in cases]
+        patterns.append({
+            "id": "retry_loop",
+            "type": "retry_loop",
+            "error_category": "retry_loop",
+            "tool": tool,
+            "error_snippet": (
+                f"{tool} failing {worst_count}x in one session — agent retrying instead of escalating."
+                + (f" Sample: {sample}" if sample else "")
+            ),
+            "occurrences": len(all_evts),
+            "affected_sessions": n_sessions,
+            "confidence": "high" if n_sessions >= 3 else "medium" if n_sessions >= 2 else "low",
+            "suggested_fix": (
+                "Agent is stuck retrying the same failing call. Consider: a helper script "
+                "that encodes the correct invocation, a PostToolUse hook that detects the "
+                "loop condition and surfaces a clear escalation message, or explicit "
+                "CLAUDE.md guidance on when to stop retrying and ask for help."
+            ),
+            "example_session_id": worst_sid,
             "first_seen_ms": min(ts_list) if ts_list else None,
             "last_seen_ms": max(ts_list) if ts_list else None,
         })
@@ -344,40 +402,79 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cat > /tmp/improve-prompt.txt << 'PROMPT'
-          Read /tmp/hh-patterns.json. For each pattern with occurrences >= 3:
+          Read /tmp/hh-patterns.json.
 
-          1. Understand what error is happening and in which tool.
-          2. Determine the right fix:
-             - permission_denied     → add command to allowedTools in .claude/settings.json
-             - missing_command       → add install note to CLAUDE.md
-             - missing_file          → add path guidance to CLAUDE.md
-             - missing_module        → add install step to setup docs
-             - auth_failure          → add credential rotation note to CLAUDE.md
-             - rate_limit            → add caching or retry helper script
-             - timeout               → add chunking note to CLAUDE.md
-             - unknown_error         → add guidance for the specific error to CLAUDE.md
-          3. Create a branch named: hh-improve-YYYYMMDD-<short-slug>
-             (use today's actual date, replace spaces/slashes with dashes in slug)
-          4. Apply the minimal fix — no refactoring, no extra changes.
-          5. Open a PR with title "[HH] Fix: <what was fixed>" and body that includes:
-             - How many sessions were affected
-             - The error snippet from the patterns file
-             - What the fix does and why
+          ## Your job
+          Make this agent system more reliable by turning recurring failures into
+          code. The goal is to move predictable, closed-ended problems out of the
+          LLM's attention so it can focus on genuinely open-ended work.
 
-          Rules:
-          - Open at most 3 PRs per run.
-          - Skip patterns with confidence=low.
-          - If nothing meets the threshold, print: "No actionable patterns found."
-          - Never modify test files or lock files.
-          - For git_error: add fetch + base-branch setup steps to CLAUDE.md.
-          - For data_leakage: note the leak type in CLAUDE.md and add it to
-            the daemon filter list in .honeyhive/filters.json.
-          - For adherence_failure: strengthen the relevant rule in CLAUDE.md.
-          - For unknown_error patterns with >= 5 occurrences: also append a
-            new entry to .honeyhive/error-categories.json "discovered" array
-            with fields: id (snake_case slug), pattern (key substring),
-            fix (one sentence), discovered_at (ISO8601), occurrences, sample.
-            This teaches future analyze runs to categorize this error properly.
+          Every CLAUDE.md line costs tokens on every session and depends on the
+          model remembering it. A hook or script runs deterministically, costs
+          nothing, and never forgets. Prefer the most reliable artifact that fits.
+
+          ## For each pattern with occurrences >= 3 and confidence != low
+
+          ### Step 1 — understand
+          Read the error_snippet and tool. Look at the error_category and
+          suggested_fix fields as hints, not prescriptions. Ask yourself:
+          - What is the agent trying to do when this fails?
+          - Is this failure predictable from context (closed-ended)?
+            Or does it require judgment each time (open-ended)?
+
+          ### Step 2 — choose the right artifact
+          Pick whichever fits the specific failure — there is no required order:
+
+          **Hook** (.claude/hooks/): best for failures that happen at a known
+          tool boundary and have a deterministic response regardless of task.
+          Examples: PreToolUse on Read to validate the path exists; PostToolUse
+          on Bash to intercept a sentinel exit code and exit 0 silently; a hook
+          that auto-fetches before git diff when exit 128 occurs.
+
+          **Script** (scripts/): best when the correct behavior can be encoded
+          once and called by name. Examples: a retry wrapper for rate-limited
+          calls; a setup script that installs a missing tool; a chunker for
+          operations that consistently time out.
+
+          **Config** (.claude/settings.json, package.json, etc.): best for
+          declarative facts. Examples: adding a command to allowedTools;
+          pinning a dependency version.
+
+          **CLAUDE.md**: only when the fix requires judgment that changes with
+          context — auth rotation steps, architectural guidance, escalation
+          rules. Keep it short. If you add something here that could later
+          become a hook or script, add a comment: `<!-- TODO: promote to hook -->`.
+
+          ### Step 3 — implement and open a PR
+          - Branch: hh-improve-YYYYMMDD-<short-slug>
+          - One fix per PR, minimal change — no refactoring, no extra cleanup
+          - PR title: "[HH] <artifact type>: <what it does>"
+            e.g. "[HH] hook: intercept git exit 128, auto-fetch origin"
+                 "[HH] script: retry wrapper for rate-limited API calls"
+                 "[HH] doc: auth rotation steps for HubSpot token expiry"
+          - PR body: sessions affected, error snippet, what the artifact does
+
+          ## Special cases
+          - retry_loop: the agent is stuck retrying a broken call. A PostToolUse
+            hook that detects N consecutive failures on the same tool and surfaces
+            a clear "stop and escalate" message is usually the right fix.
+          - exit_code_sentinel: the script uses non-zero exits as no-op signals.
+            A wrapper script or PostToolUse hook that intercepts the specific code
+            and exits 0 silently removes it from error traces permanently.
+          - data_leakage: a PreToolUse hook that scrubs known-sensitive patterns
+            from tool inputs before they leave the session.
+          - adherence_failure: read the low-scoring sessions to find which rule
+            was violated, then either strengthen the CLAUDE.md rule or — if the
+            violation is mechanical (always the same mistake) — encode it as a hook.
+          - unknown_error with >= 5 occurrences: also append to
+            .honeyhive/error-categories.json "discovered" array (id, pattern,
+            fix, discovered_at ISO8601, occurrences, sample) so future analyze
+            runs classify it automatically.
+
+          ## Limits
+          - At most 3 PRs per run — pick the highest-impact patterns
+          - Never modify test files or lock files
+          - If nothing qualifies, print: "No actionable patterns found."
           PROMPT
           claude --dangerously-skip-permissions -p "$(cat /tmp/improve-prompt.txt)"
 
@@ -547,6 +644,10 @@ def analyze_cmd(
 
     # Detect error patterns from tool failure events.
     patterns = _detect_patterns(error_events, categories, skip_patterns)
+
+    # Detect retry loops — same tool failing 5+ times in one session.
+    loop_patterns = _detect_loop_patterns(error_events)
+    patterns.extend(loop_patterns)
 
     # Detect evaluator-based patterns (data leakage + adherence failures).
     # These are additive — if evaluators haven't been pushed yet they return [].
