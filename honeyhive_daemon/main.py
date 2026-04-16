@@ -38,6 +38,8 @@ from .config import (
     save_config,
     save_user_config,
 )
+from .ci import analyze_cmd, add_to_ci_cmd
+from .evaluators import push_evaluators_cmd
 from .exporter import export_event, export_events
 from .filters import (
     FilterVerdict,
@@ -458,6 +460,11 @@ def doctor() -> None:
     click.echo(f"Claude hook command installed: {installed}")
     repo_root = _resolve_repo(None)
     click.echo(f"Git repo detected: {'yes' if repo_root else 'no'}")
+
+
+cli.add_command(analyze_cmd)
+cli.add_command(add_to_ci_cmd)
+cli.add_command(push_evaluators_cmd)
 
 
 @cli.group()
