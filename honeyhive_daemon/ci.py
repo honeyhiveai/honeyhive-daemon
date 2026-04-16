@@ -14,6 +14,7 @@ import click
 import httpx
 
 from .config import DEFAULT_BASE_URL, find_project_root, load_project_config
+from .error_categories import categorize, load_rules
 
 
 # ---------------------------------------------------------------------------
@@ -25,58 +26,6 @@ CADENCES = {
     "daily": "0 9 * * *",
     "weekly": "0 9 * * 1",
 }
-
-# ---------------------------------------------------------------------------
-# Error categorisation
-# ---------------------------------------------------------------------------
-
-_ERROR_RULES = [
-    ("permission denied",    "permission_denied",  "Add the command to allowedTools in .claude/settings.json"),
-    ("operation not permitted", "permission_denied", "Add the command to allowedTools in .claude/settings.json"),
-    ("command not found",    "missing_command",    "Install the missing tool or document it in CLAUDE.md"),
-    ("no such file",         "missing_file",       "Add path guidance or setup steps to CLAUDE.md"),
-    ("cannot find module",   "missing_module",     "Add the install step to your setup docs"),
-    ("module not found",     "missing_module",     "Add the install step to your setup docs"),
-    ("authentication",       "auth_failure",       "Verify API credentials and document rotation in CLAUDE.md"),
-    ("unauthorized",         "auth_failure",       "Verify API credentials and document rotation in CLAUDE.md"),
-    ("http 401",             "auth_failure",       "Verify API credentials and document rotation in CLAUDE.md"),
-    ("401 unauthorized",     "auth_failure",       "Verify API credentials and document rotation in CLAUDE.md"),
-    ("rate limit",           "rate_limit",         "Add retry logic or caching for this operation"),
-    ("too many requests",    "rate_limit",         "Add retry logic or caching for this operation"),
-    ("timed out",            "timeout",            "Break into smaller operations or add a timeout handler"),
-    ("search timed out",     "timeout",            "Use narrower glob patterns or break search into smaller scopes"),
-    ("connection refused",   "connection_refused", "Check service availability and add health-check guidance to CLAUDE.md"),
-    ("syntax error",         "syntax_error",       "Review code-generation patterns; add examples to CLAUDE.md"),
-    ("traceback",            "python_exception",   "Add error handling guidance or a helper script"),
-    ("exit code 127",        "missing_command",    "Install the missing tool or add it to PATH in CLAUDE.md"),
-    ("exit code 126",        "permission_denied",  "Check file permissions; add execution steps to CLAUDE.md"),
-    ("exit code 128",        "git_error",          "Add git setup steps to CLAUDE.md (fetch, base branch, worktree)"),
-    ("fatal: ",              "git_error",          "Add git setup steps to CLAUDE.md (fetch, base branch, worktree)"),
-    ("no merge base",        "git_error",          "Ensure worktrees fetch origin before diffing; add to CLAUDE.md"),
-]
-
-# Errors that are too generic to be actionable on their own.
-_SKIP_IF_ONLY = {"exit code 1", "exit code 2", "exit code 1\n"}
-
-
-def _categorize(error: str) -> tuple[str, str]:
-    lower = error.lower().strip()
-    # Skip events whose entire error content is just a generic exit code.
-    if lower in _SKIP_IF_ONLY or lower.startswith("exit code 1\n") is False and lower == "exit code 1":
-        if lower in _SKIP_IF_ONLY:
-            return "", ""  # sentinel: caller skips this event
-    for pattern, key, fix in _ERROR_RULES:
-        if pattern in lower:
-            return key, fix
-    # If the text is non-trivial (>20 chars beyond the exit-code prefix), keep it.
-    content = lower
-    for prefix in ("exit code 1\n", "exit code 2\n", "exit code 1 "):
-        if content.startswith(prefix):
-            content = content[len(prefix):]
-            break
-    if len(content.strip()) < 10:
-        return "", ""  # too short to be useful
-    return "unknown_error", "Review the recurring error and add guidance to CLAUDE.md"
 
 
 # ---------------------------------------------------------------------------
@@ -148,21 +97,29 @@ def _extract_error(ev: dict) -> str:
                 return block.strip()
 
     # 3. Fallback: any bare error/stderr key directly in outputs.
+    # Use explicit isinstance check to handle non-string values safely.
     for key in ("stderr", "error", "message"):
-        val = (outputs.get(key) or "").strip()
+        raw_val = outputs.get(key)
+        if not raw_val:
+            continue
+        val = raw_val.strip() if isinstance(raw_val, str) else str(raw_val).strip()
         if val:
             return val
 
     return ""
 
 
-def _detect_patterns(error_events: list) -> list:
+def _detect_patterns(
+    error_events: list,
+    categories: list,
+    skip_patterns: list,
+) -> list:
     groups: dict = defaultdict(list)
     for ev in error_events:
         error = _extract_error(ev)
         if not error:
             continue
-        cat_key, fix = _categorize(error)
+        cat_key, fix = categorize(error, categories, skip_patterns)
         if not cat_key:  # filtered as too-generic
             continue
         groups[(cat_key, fix)].append((ev, error))
@@ -194,6 +151,110 @@ def _detect_patterns(error_events: list) -> list:
         })
 
     return sorted(patterns, key=lambda p: p["occurrences"], reverse=True)
+
+
+def _detect_evaluator_patterns(url: str, key: str, project: str, since_ms: int) -> list:
+    """Query evaluator results and surface data-leakage and adherence failures.
+
+    Looks for two evaluator metric names created by ``push-evaluators``:
+    - ``Sensitive Data Leakage - <slug>`` → returns LEAK:<types> or CLEAN
+    - ``Instruction Adherence - <slug>``  → float 0-4; low scores = adherence failures
+
+    Both metrics are optional — if neither evaluator has run yet, returns [].
+    Gracefully handles API errors (HH may not support nested metric filters
+    on all deployments).
+    """
+    from .evaluators import _safe_project_slug  # avoid circular at module level
+
+    slug = _safe_project_slug(project)
+    leakage_metric = f"Sensitive Data Leakage - {slug}"
+    adherence_metric = f"Instruction Adherence - {slug}"
+    patterns: list[dict] = []
+
+    # ----- Data leakage -----
+    try:
+        leak_events = _query(url, key, project, filters=[
+            {"field": f"metrics.{leakage_metric}", "operator": "contains",
+             "value": "LEAK", "type": "string"},
+            {"field": "start_time", "operator": ">=", "type": "number", "value": since_ms},
+        ], limit=500)
+
+        if leak_events:
+            # Aggregate by leak type (parse "LEAK:type1,type2").
+            type_groups: dict = defaultdict(list)
+            for ev in leak_events:
+                metric_val = (ev.get("metrics") or {}).get(leakage_metric, "")
+                leak_types = metric_val.replace("LEAK:", "").split(",") if "LEAK:" in metric_val else ["unknown"]
+                for t in leak_types:
+                    t = t.strip()
+                    if t:
+                        type_groups[t].append(ev)
+
+            for leak_type, evts in sorted(type_groups.items(), key=lambda x: -len(x[1])):
+                n = len(evts)
+                session_ids = list({str(e["session_id"]) for e in evts if e.get("session_id")})
+                ts_list = [e["start_time"] for e in evts if e.get("start_time")]
+                confidence = "high" if n >= 5 else "medium" if n >= 3 else "low"
+                patterns.append({
+                    "id": f"data_leakage_{leak_type}",
+                    "type": "data_leakage",
+                    "error_category": "data_leakage",
+                    "tool": "evaluator",
+                    "error_snippet": f"{leak_type.replace('_', ' ')} found in session inputs/outputs",
+                    "occurrences": n,
+                    "affected_sessions": len(session_ids),
+                    "confidence": confidence,
+                    "suggested_fix": (
+                        "Remove sensitive data from prompts and tool outputs; "
+                        "use environment variables instead of inline credentials"
+                    ),
+                    "example_session_id": session_ids[0] if session_ids else None,
+                    "first_seen_ms": min(ts_list) if ts_list else None,
+                    "last_seen_ms": max(ts_list) if ts_list else None,
+                    "evaluator": leakage_metric,
+                })
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        pass  # evaluator not pushed yet or API doesn't support metric filtering
+
+    # ----- Adherence failures -----
+    try:
+        low_adherence = _query(url, key, project, filters=[
+            {"field": f"metrics.{adherence_metric}", "operator": "less than",
+             "value": 2, "type": "number"},
+            {"field": "start_time", "operator": ">=", "type": "number", "value": since_ms},
+        ], limit=500)
+
+        if low_adherence:
+            session_ids = list({str(e["session_id"]) for e in low_adherence if e.get("session_id")})
+            ts_list = [e["start_time"] for e in low_adherence if e.get("start_time")]
+            n = len(low_adherence)
+            confidence = "high" if n >= 5 else "medium" if n >= 3 else "low"
+            # Find the lowest-scoring example
+            worst = min(
+                (e for e in low_adherence if (e.get("metrics") or {}).get(adherence_metric) is not None),
+                key=lambda e: e["metrics"][adherence_metric],
+                default=low_adherence[0],
+            )
+            score = (worst.get("metrics") or {}).get(adherence_metric, "?")
+            patterns.append({
+                "id": "adherence_failure",
+                "type": "adherence_failure",
+                "error_category": "adherence_failure",
+                "tool": "evaluator",
+                "error_snippet": f"Instruction adherence score {score}/4 — agent deviated from CLAUDE.md rules",
+                "occurrences": n,
+                "affected_sessions": len(session_ids),
+                "confidence": confidence,
+                "suggested_fix": "Review deviating sessions and strengthen rules in CLAUDE.md",
+                "example_session_id": session_ids[0] if session_ids else None,
+                "first_seen_ms": min(ts_list) if ts_list else None,
+                "last_seen_ms": max(ts_list) if ts_list else None,
+                "evaluator": adherence_metric,
+            })
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        pass
+
+    return patterns
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +370,14 @@ jobs:
           - If nothing meets the threshold, print: "No actionable patterns found."
           - Never modify test files or lock files.
           - For git_error: add fetch + base-branch setup steps to CLAUDE.md.
+          - For data_leakage: note the leak type in CLAUDE.md and add it to
+            the daemon filter list in .honeyhive/filters.json.
+          - For adherence_failure: strengthen the relevant rule in CLAUDE.md.
+          - For unknown_error patterns with >= 5 occurrences: also append a
+            new entry to .honeyhive/error-categories.json "discovered" array
+            with fields: id (snake_case slug), pattern (key substring),
+            fix (one sentence), discovered_at (ISO8601), occurrences, sample.
+            This teaches future analyze runs to categorize this error properly.
           PROMPT
           claude --dangerously-skip-permissions -p "$(cat /tmp/improve-prompt.txt)"
 
@@ -318,11 +387,32 @@ jobs:
 """
 
 
+_PROJECT_SAFE_RE = re.compile(r"[^a-zA-Z0-9_\-.]")
+
+
+def _validate_project_for_yaml(project: str) -> None:
+    """Raise ClickException if the project name is unsafe to embed in shell commands.
+
+    Project names with spaces or shell metacharacters would produce broken YAML
+    without additional quoting. Reject early with a clear error rather than
+    silently generating a broken workflow file.
+    """
+    if _PROJECT_SAFE_RE.search(project):
+        raise click.ClickException(
+            f"Project name {project!r} contains characters that are unsafe in shell "
+            "commands. Use only letters, digits, hyphens, underscores, and dots.\n"
+            "Rename the project with 'honeyhive-daemon init --project safe-name'."
+        )
+
+
 def generate_workflow(project: str, cadence: str) -> str:
+    _validate_project_for_yaml(project)
     cron = CADENCES[cadence]
+    # Substitute __PROJECT__ before __CRON__ to prevent any cross-contamination
+    # if the project name somehow contained the __CRON__ token.
     return (
         _WORKFLOW_TEMPLATE
-        .replace("__PROJECT__", project)
+        .replace("__PROJECT__", project, )
         .replace("__CRON__", cron)
     )
 
@@ -400,38 +490,40 @@ def analyze_cmd(
 
     since_ms = _parse_since_ms(since)
 
+    # Load per-repo error category config (falls back to built-in defaults).
+    categories, skip_patterns = load_rules(str(Path.cwd()))
+
     click.echo(f"Querying project '{project}' for the last {since}…", err=True)
 
     # Query failed tool events.
-    # Primary filter: metadata.tool.status = failure (set by daemon on every
-    # PostToolUseFailure event). This is more reliable than `error is not null`
-    # because the daemon always stamps this field even when the error text lives
-    # inside outputs.tool_response rather than the top-level error field.
-    # Fallback to `error is not null` so we also catch legacy / third-party events
-    # that directly set an error field.
+    # Bug fix: use an explicit flag to distinguish "query succeeded with 0 results"
+    # from "query failed" — previously both set failure_events=[] which caused the
+    # second query's error handler to raise when the first merely returned 0 events.
+    first_query_ok = False
+    failure_events: list = []
     try:
         failure_events = _query(url, key, project, filters=[
             {"field": "metadata.tool.status", "operator": "is",  "type": "string", "value": "failure"},
             {"field": "start_time",           "operator": ">=",  "type": "number", "value": since_ms},
         ])
+        first_query_ok = True
     except (httpx.HTTPStatusError, httpx.RequestError):
-        failure_events = []
+        first_query_ok = False
 
+    errfield_events: list = []
     try:
         errfield_events = _query(url, key, project, filters=[
             {"field": "error",      "operator": "is not null", "type": "string"},
             {"field": "start_time", "operator": ">=",          "type": "number", "value": since_ms},
         ])
     except httpx.HTTPStatusError as exc:
-        if not failure_events:
+        if not first_query_ok:
             raise click.ClickException(
                 f"HoneyHive API error {exc.response.status_code}: {exc.response.text[:200]}"
             )
-        errfield_events = []
     except httpx.RequestError as exc:
-        if not failure_events:
+        if not first_query_ok:
             raise click.ClickException(f"Network error querying HoneyHive: {exc}")
-        errfield_events = []
 
     # Merge and deduplicate by event_id.
     seen: set = set()
@@ -453,7 +545,15 @@ def analyze_cmd(
     except Exception:
         session_count = None
 
-    patterns = _detect_patterns(error_events)
+    # Detect error patterns from tool failure events.
+    patterns = _detect_patterns(error_events, categories, skip_patterns)
+
+    # Detect evaluator-based patterns (data leakage + adherence failures).
+    # These are additive — if evaluators haven't been pushed yet they return [].
+    evaluator_patterns = _detect_evaluator_patterns(url, key, project, since_ms)
+    patterns.extend(evaluator_patterns)
+    patterns.sort(key=lambda p: p["occurrences"], reverse=True)
+
     actionable = sum(1 for p in patterns if p["occurrences"] >= 3)
 
     click.echo(
@@ -547,12 +647,28 @@ def add_to_ci_cmd(
     yaml_content = generate_workflow(project, cadence)
     workflow_path.write_text(yaml_content, encoding="utf-8")
 
+    # Scaffold per-repo error categories config if it doesn't exist yet.
+    from .error_categories import init_config as _init_categories
+    root_for_cats = find_project_root(str(cwd)) or str(cwd)
+    cats_path = _init_categories(root_for_cats)
+    cats_existed = cats_path.exists() and cats_path.stat().st_size > 0
+
     cron = CADENCES[cadence]
     click.echo("")
-    click.echo(
-        f"{'Updated' if already_existed else 'Created'} "
-        f"{workflow_path.relative_to(cwd)}"
-    )
+    try:
+        wf_display = workflow_path.relative_to(cwd)
+    except ValueError:
+        wf_display = workflow_path
+    click.echo(f"{'Updated' if already_existed else 'Created'} {wf_display}")
+
+    try:
+        cats_rel = cats_path.relative_to(cwd)
+        click.echo(
+            f"{'Already exists' if cats_existed else 'Created'} "
+            f"{cats_rel}  (per-repo error categories)"
+        )
+    except ValueError:
+        pass
     click.echo("")
     click.echo("  Workflow:  HoneyHive Proactive Improvements")
     click.echo(f"  Project:   {project}")
