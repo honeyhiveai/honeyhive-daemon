@@ -68,10 +68,13 @@ DEFAULT_CATEGORIES: list[dict] = [
     {"id": "connection_refused", "pattern": "connection refused",      "fix": "Check service availability and add health-check guidance to CLAUDE.md"},
     {"id": "syntax_error",       "pattern": "syntax error",            "fix": "Review code-generation patterns; add examples to CLAUDE.md"},
     {"id": "python_exception",   "pattern": "traceback",               "fix": "Add error handling guidance or a helper script"},
-    # Sentinel exit codes — non-failure signals misread as errors
-    {"id": "exit_code_sentinel", "pattern": "already promoted",        "fix": "Document exit code contract; the script uses non-zero exits as no-op signals, not failures"},
+    # Sentinel exit codes — non-failure signals misread as errors.
+    # "already exists" and "nothing to do" are generic enough to be defaults.
+    # Repo-specific sentinels (e.g. "already promoted") belong in
+    # .honeyhive/error-categories.json "discovered" or "categories" sections.
     {"id": "exit_code_sentinel", "pattern": "already exists",          "fix": "Document exit code contract for idempotent operations"},
     {"id": "exit_code_sentinel", "pattern": "nothing to do",           "fix": "Document exit code contract; treat this sentinel exit silently"},
+    {"id": "exit_code_sentinel", "pattern": "skipping",                "fix": "Document exit code contract; this may be a no-op signal, not a failure"},
     # Missing env / bad args
     {"id": "env_var_missing",    "pattern": "unbound variable",        "fix": "Add preflight env-var validation; document required vars in CLAUDE.md with a setup snippet"},
     {"id": "env_var_missing",    "pattern": "parameter not set",       "fix": "Add preflight env-var validation and a .env.example"},
