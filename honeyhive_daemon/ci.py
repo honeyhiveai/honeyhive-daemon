@@ -245,6 +245,16 @@ jobs:
           git config user.name "HoneyHive Improvement Bot"
           git config user.email "improvements@honeyhive.ai"
 
+      - name: Push evaluators
+        env:
+          HH_API_KEY: ${{ secrets.HH_API_KEY }}
+          HH_API_URL: ${{ vars.HH_API_URL }}
+        run: |
+          honeyhive-daemon push-evaluators \\
+            --project __PROJECT__
+          # Idempotent — safe to run on every CI pass.
+          # Updates the CLAUDE.md adherence evaluator if the file changed.
+
       - name: Analyse Claude Code sessions
         id: analyse
         env:
