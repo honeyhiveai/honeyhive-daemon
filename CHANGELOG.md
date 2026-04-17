@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.7.4 (2026-04-17)
+
+### Bug Fixes
+
+- **fix(WAG-310): guard against list values in `_extract_error`** — `analyze` no longer crashes when the top-level `error` field on a trace is a list of content blocks (the shape Claude Code emits for structured errors). `_extract_error` now handles list/str/dict/None variants explicitly. (#6)
+- **fix(WAG-305): don't cache `None` in `_read_session_name_from_transcript`** — The `lru_cache` wrapping the transcript reader was caching `None` when the transcript file was empty or missing at `SessionStart` time (Claude Code writes the first transcript line a moment after the hook fires). Once `None` was cached for that path, the session name never populated even after the transcript was written, so downstream events carried no `session_name`. The reader now only caches successful reads, and returns `None` without caching when the file is empty/unreadable so the next event retries. (#5)
+
+## 0.7.3 (2026-04-16)
+
+### Bug Fixes
+
+- **fix: remove `scripts/` hardcoding from CI prompt** — The `analyze` → CI improvement prompt previously assumed scripts live under `scripts/`, which isn't a universal convention. The prompt now instructs Claude to discover where scripts live in the target repo (`bin/`, `scripts/`, `tools/`, `Makefile`, etc.) before proposing changes.
+
+## 0.7.2 (2026-04-16)
+
+### Bug Fixes
+
+- **fix: move repo-specific sentinel patterns out of built-in defaults** — `"already promoted"` was a Waggle-specific sentinel that had leaked into the built-in error-category defaults. Built-in defaults now only contain patterns that generalize across any Claude Code repo; repo-specific sentinels belong in the per-repo `.honeyhive/error-categories.json` `categories` section.
+
+## 0.7.1 (2026-04-16)
+
+### Features
+
+- **feat: expand error categories** — Added `sentinel_exit_code`, `env_var_missing`, `arg_mismatch`, `json_parse_error`, and `deprecated_command` categories. `categorize()` now returns `(id, fix, fix_tier)` so downstream code can reason about fix confidence.
+
+- **feat: loop-pattern detection in `analyze`** — New `_detect_loop_patterns()` finds sessions where the same tool fails 5+ times in a row (agent stuck retrying the same broken command). Wired into `analyze_cmd` so loop failures surface alongside recurring error patterns.
+
+### Internals
+
+- **CI improvement prompt rewrite** — The prompt now states the tokens→code philosophy and lets Claude choose the right artifact (hook / script / config / doc) based on the specific failure, rather than following a rigid dispatch table.
+
 ## 0.7.0 (2026-04-16)
 
 ### Features

@@ -1,6 +1,6 @@
 [project]
 name = "honeyhive-daemon"
-version = "0.7.3"
+version = "0.7.4"
 description = "Minimal Claude Code telemetry daemon for HoneyHive"
 readme = "README.md"
 requires-python = ">=3.11"
