@@ -7,6 +7,7 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
+from honeyhive_daemon.ci import _extract_error
 from honeyhive_daemon.claude_hooks import install_claude_hooks, normalize_claude_payload
 from honeyhive_daemon.config import DaemonConfig
 from honeyhive_daemon.exporter import export_event
@@ -532,3 +533,43 @@ def test_push_pending_session_artifacts_updates_root_event(
     assert len(metrics_captured) == 1
     assert metrics_captured[0]["event_id"] == "sess-root-1"
     assert "coding_agent.total_events" in metrics_captured[0]["metrics"]
+
+
+# ---------------------------------------------------------------------------
+# _extract_error — WAG-310: guard against list values in ev["error"]
+# ---------------------------------------------------------------------------
+
+def test_extract_error_string_direct() -> None:
+    """Plain string in top-level error field."""
+    ev = {"error": "permission denied"}
+    assert _extract_error(ev) == "permission denied"
+
+
+def test_extract_error_list_text_blocks() -> None:
+    """Multi-block list in top-level error field must not raise AttributeError."""
+    ev = {"error": [{"type": "text", "text": "tool call failed"}]}
+    assert _extract_error(ev) == "tool call failed"
+
+
+def test_extract_error_list_plain_strings() -> None:
+    """List of plain strings in top-level error field."""
+    ev = {"error": ["first error", "second error"]}
+    assert _extract_error(ev) == "first error"
+
+
+def test_extract_error_list_empty() -> None:
+    """Empty list in top-level error field returns empty string."""
+    ev = {"error": []}
+    assert _extract_error(ev) == ""
+
+
+def test_extract_error_none() -> None:
+    """None error field falls through to tool_response."""
+    ev = {"error": None, "outputs": {"tool_response": {"stderr": "bad command"}}}
+    assert _extract_error(ev) == "bad command"
+
+
+def test_extract_error_tool_response_list() -> None:
+    """List-valued tool_response still works."""
+    ev = {"outputs": {"tool_response": [{"text": "stderr: not found"}]}}
+    assert _extract_error(ev) == "stderr: not found"
