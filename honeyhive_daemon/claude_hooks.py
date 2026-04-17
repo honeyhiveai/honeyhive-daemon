@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -159,15 +158,27 @@ def normalize_claude_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]
     return event
 
 
-@lru_cache(maxsize=256)
+# Cache for session names keyed by transcript path.
+# Only non-None results are stored so that sessions whose transcript file is
+# empty when SessionStart fires (a race condition with Claude Code's write) are
+# retried on every subsequent hook call until the customTitle line appears.
+# Using @lru_cache would permanently cache the None and the session would remain
+# unnamed for the lifetime of the daemon process.
+_session_name_cache: Dict[str, str] = {}
+
+
 def _read_session_name_from_transcript(transcript_path: str) -> Optional[str]:
     """Read the session name from the first line of a Claude Code transcript.
 
     Claude Code writes a ``{"type": "custom-title", "customTitle": "..."}``
-    record as the very first line of the transcript JSONL before any hooks fire,
-    so it is available by the time SessionStart is processed.  The result is
-    cached per transcript path so repeated calls (one per hook event) are cheap.
+    record as the very first line of the transcript JSONL.  We cache the result
+    per transcript path, but **only when a name is found** — a ``None`` result
+    (empty file, not-yet-written) is never cached so the file is re-read on the
+    next hook call.  This handles the race condition where ``SessionStart`` fires
+    before Claude Code finishes writing the first line.
     """
+    if transcript_path in _session_name_cache:
+        return _session_name_cache[transcript_path]
     try:
         path = Path(transcript_path)
         if not path.exists() or not path.is_file():
@@ -178,7 +189,10 @@ def _read_session_name_from_transcript(transcript_path: str) -> Optional[str]:
             return None
         record = json.loads(first_line)
         if record.get("type") == "custom-title":
-            return record.get("customTitle") or None
+            name = record.get("customTitle") or None
+            if name:
+                _session_name_cache[transcript_path] = name
+            return name
     except (json.JSONDecodeError, OSError):
         pass
     return None

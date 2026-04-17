@@ -71,10 +71,10 @@ def test_normalize_claude_session_start_with_transcript_session_name(
     tmp_path: Path,
 ) -> None:
     """Session name is extracted from the transcript's custom-title line."""
-    from honeyhive_daemon.claude_hooks import _read_session_name_from_transcript
+    from honeyhive_daemon.claude_hooks import _session_name_cache
 
-    # Clear the LRU cache so our tmp file is read fresh
-    _read_session_name_from_transcript.cache_clear()
+    # Clear the manual dict cache so our tmp file is read fresh
+    _session_name_cache.clear()
 
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text(
@@ -119,9 +119,9 @@ def test_normalize_claude_session_name_from_payload() -> None:
 
 def test_session_name_propagated_to_all_events(tmp_path: Path) -> None:
     """Session name appears in metadata for non-session events too."""
-    from honeyhive_daemon.claude_hooks import _read_session_name_from_transcript
+    from honeyhive_daemon.claude_hooks import _session_name_cache
 
-    _read_session_name_from_transcript.cache_clear()
+    _session_name_cache.clear()
 
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text(
