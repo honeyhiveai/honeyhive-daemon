@@ -64,7 +64,22 @@ def _extract_error(ev: dict) -> str:
     """
     # 1. Top-level ``error`` field — set by _merge_tool_events when raw_post
     #    has an ``error`` key (e.g. permission-denied payloads).
-    direct = (ev.get("error") or "").strip()
+    #    Guard against list values: multi-block Claude Code content arrives as
+    #    a list of dicts/strings, not a plain string.
+    raw_direct = ev.get("error")
+    if isinstance(raw_direct, str):
+        direct = raw_direct.strip()
+    elif isinstance(raw_direct, list):
+        direct = next(
+            (
+                str(b.get("text", b) if isinstance(b, dict) else b).strip()
+                for b in raw_direct
+                if b and str(b.get("text", b) if isinstance(b, dict) else b).strip()
+            ),
+            "",
+        )
+    else:
+        direct = ""
     if direct:
         return direct
 
