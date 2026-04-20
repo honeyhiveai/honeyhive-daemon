@@ -63,14 +63,13 @@ def update_event(
         f"url={_get_events_endpoint(config.base_url)} "
         f"api_key_fingerprint={_key_fingerprint(config.api_key)}"
     )
+    data: Dict[str, Any] = {"event_id": event_id}
+    if outputs is not None:
+        data["outputs"] = outputs
+    if metrics is not None:
+        data["metrics"] = metrics
     client = HoneyHive(api_key=config.api_key, base_url=config.base_url)
-    client.events.update(
-        data={
-            "event_id": event_id,
-            "outputs": outputs,
-            "metrics": metrics,
-        }
-    )
+    client.events.update(data=data)
 
 
 def _get_events_endpoint(base_url: str) -> str:
