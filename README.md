@@ -26,9 +26,23 @@ A local daemon that captures Claude Code activity via hooks and exports structur
 
 ### Quickstart
 
+**Per-project setup (recommended):**
+
 ```bash
-pip install -e .
-honeyhive-daemon run --key $HH_API_KEY --url $HH_API_URL --project my-project
+pip install honeyhive-daemon
+
+# In your project repo
+honeyhive-daemon init --project my-project
+# Creates .honeyhive/config.json and .honeyhive/config.local.json
+# Edit .honeyhive/config.local.json to set your api_key_env
+
+HH_API_KEY=your-key honeyhive-daemon run
+```
+
+**Single-project (legacy):**
+
+```bash
+honeyhive-daemon run --key $HH_API_KEY --project my-project
 ```
 
 The daemon stores local state in `~/.honeyhive/daemon/` and installs Claude hooks in `~/.claude/settings.json`.
