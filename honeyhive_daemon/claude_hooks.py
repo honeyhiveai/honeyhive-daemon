@@ -75,12 +75,12 @@ def _sync_hook_entries(
         preserved_entries.append(updated_entry)
 
     for matcher in desired_matchers:
-        entry: Dict[str, Any] = {
+        new_entry: Dict[str, Any] = {
             "hooks": [{"type": "command", "command": command}],
         }
         if matcher is not None:
-            entry["matcher"] = matcher
-        preserved_entries.append(entry)
+            new_entry["matcher"] = matcher
+        preserved_entries.append(new_entry)
 
     if preserved_entries != normalized_original:
         entries[:] = preserved_entries

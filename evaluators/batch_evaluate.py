@@ -283,7 +283,7 @@ def main() -> None:
 
     # Summary report
     print(f"\n{'='*60}")
-    print(f"BATCH EVALUATION SUMMARY")
+    print("BATCH EVALUATION SUMMARY")
     print(f"{'='*60}")
     print(f"Sessions evaluated: {total_evaluated}")
     if not args.dry_run:

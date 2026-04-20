@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import click
 
@@ -34,7 +35,6 @@ from .config import (
     load_config,
     load_user_config,
     resolve_config,
-    resolve_config_for_cwd,
     save_config,
     save_user_config,
 )
@@ -42,7 +42,6 @@ from .ci import analyze_cmd, add_to_ci_cmd
 from .evaluators import push_evaluators_cmd
 from .exporter import export_event, export_events
 from .filters import (
-    FilterVerdict,
     apply_filters,
     filter_transcript_content,
     load_filters,
@@ -319,6 +318,8 @@ def run(
     click.echo(f"Project: {resolved_project}")
     if repo_root is not None:
         click.echo(f"Repo: {repo_root}")
+    click.echo(f"HH_FRONTEND_URL: {os.getenv('HH_FRONTEND_URL', '<not set>')}")
+    click.echo(f"HH_PROJECT_ID: {os.getenv('HH_PROJECT_ID', '<not set>')}")
     click.echo(f"Claude hooks {'updated' if hooks_changed else 'already installed'}")
     if repo_root is not None:
         click.echo(
@@ -449,6 +450,114 @@ def stop() -> None:
         raise SystemExit(1)
 
 
+def _running_daemon_pid() -> Optional[int]:
+    """Return the PID of a live daemon, cleaning up stale PID files."""
+    pid_path = get_pid_path()
+    if not pid_path.exists():
+        return None
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except ValueError:
+        pid_path.unlink(missing_ok=True)
+        return None
+    try:
+        os.kill(pid, 0)
+        return pid
+    except ProcessLookupError:
+        pid_path.unlink(missing_ok=True)
+        return None
+    except PermissionError:
+        # Process exists but we can't signal it — treat as running.
+        return pid
+
+
+def _spawn_background_daemon() -> int:
+    """Fork a detached ``honeyhive-daemon run`` and return its PID."""
+    log_path = get_daemon_home() / "daemon.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(
+            [sys.argv[0], "run"],
+            stdout=log_fh,
+            stderr=log_fh,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        log_fh.close()
+    return proc.pid
+
+
+@cli.command()
+def start() -> None:
+    """Start the daemon in the background (idempotent)."""
+    existing = _running_daemon_pid()
+    if existing is not None:
+        click.echo(f"Daemon already running (PID {existing}).")
+        return
+    pid = _spawn_background_daemon()
+    # Give the child a moment to write its PID file / fail loudly.
+    for _ in range(20):
+        time.sleep(0.1)
+        running = _running_daemon_pid()
+        if running is not None:
+            click.echo(f"Started HoneyHive daemon (PID {running}).")
+            return
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            click.echo(
+                f"Daemon exited immediately. See {get_daemon_home() / 'daemon.log'}."
+            )
+            raise SystemExit(1)
+    click.echo(f"Started HoneyHive daemon (PID {pid}); PID file not yet written.")
+
+
+@cli.command()
+@click.option(
+    "--timeout",
+    default=10.0,
+    show_default=True,
+    help="Seconds to wait for the existing daemon to exit.",
+)
+def restart(timeout: float) -> None:
+    """Stop the running daemon (if any) and start a fresh one."""
+    existing = _running_daemon_pid()
+    if existing is not None:
+        try:
+            os.kill(existing, signal.SIGTERM)
+            click.echo(f"Sent SIGTERM to daemon (PID {existing}).")
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if _running_daemon_pid() is None:
+                break
+            time.sleep(0.1)
+        else:
+            click.echo(
+                f"Daemon (PID {existing}) did not exit within {timeout}s; aborting."
+            )
+            raise SystemExit(1)
+    pid = _spawn_background_daemon()
+    for _ in range(20):
+        time.sleep(0.1)
+        running = _running_daemon_pid()
+        if running is not None:
+            click.echo(f"Started HoneyHive daemon (PID {running}).")
+            return
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            click.echo(
+                f"Daemon exited immediately. See {get_daemon_home() / 'daemon.log'}."
+            )
+            raise SystemExit(1)
+    click.echo(f"Started HoneyHive daemon (PID {pid}); PID file not yet written.")
+
+
 @cli.command()
 def doctor() -> None:
     """Run a lightweight daemon self-check."""
@@ -558,7 +667,7 @@ def ingest_claude_hook() -> None:
     # Without a session.start event in HoneyHive, artifact updates fail
     # with 400 and all session data is lost. Create it now.
     if not is_session_start and not session_state.get("session_start_exported"):
-        synthetic_session = {
+        synthetic_session: Dict[str, Any] = {
             "event_id": str(event["session_id"]),  # session.start uses session_id as event_id
             "session_id": str(event["session_id"]),
             "event_type": "session",
@@ -614,7 +723,6 @@ def ingest_claude_hook() -> None:
     hook_phase = event.pop("_hook_phase", None)
     hook_failure = event.pop("_hook_failure", False)
     tool_use_id = event.get("tool_use_id")
-
     if hook_phase == "pre" and tool_use_id:
         buffer_pending_tool_event(str(event["session_id"]), tool_use_id, event)
         log_message(
