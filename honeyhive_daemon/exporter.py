@@ -53,7 +53,6 @@ def update_event(
     config: DaemonConfig,
     *,
     event_id: str,
-    inputs: Optional[Dict[str, Any]] = None,
     outputs: Optional[Dict[str, Any]] = None,
     metrics: Optional[Dict[str, Any]] = None,
 ) -> None:
@@ -65,8 +64,6 @@ def update_event(
         f"api_key_fingerprint={_key_fingerprint(config.api_key)}"
     )
     data: Dict[str, Any] = {"event_id": event_id}
-    if inputs is not None:
-        data["inputs"] = inputs
     if outputs is not None:
         data["outputs"] = outputs
     if metrics is not None:

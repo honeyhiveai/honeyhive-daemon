@@ -272,7 +272,7 @@ def apply_filters(
     command_exclude = filters.get("command_exclude") or []
     if command and command_exclude:
         if _regex_match(command, command_exclude):
-            return FilterVerdict(FilterVerdict.DROP, f"command matches command_exclude")
+            return FilterVerdict(FilterVerdict.DROP, "command matches command_exclude")
 
     # ── Redaction check ───────────────────────────────────────
     redact_paths = filters.get("redact_paths") or []

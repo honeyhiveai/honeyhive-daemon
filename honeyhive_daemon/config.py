@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -157,9 +156,7 @@ def load_routes() -> list:
         return []
 
 
-def resolve_config_for_cwd(
-    default_config: DaemonConfig, cwd: Optional[str]
-) -> DaemonConfig:
+def resolve_config_for_cwd(default_config: DaemonConfig, cwd: Optional[str]) -> DaemonConfig:
     """Resolve the DaemonConfig for a given cwd using routing rules.
 
     If a route matches, override project and api_key from the route.
@@ -304,10 +301,7 @@ def load_project_local_config(project_root: Path) -> dict:
         else:
             from .state import log_message
 
-            log_message(
-                f"load_project_local_config: env var {api_key_env!r} is not set; "
-                f"skipping api_key resolution"
-            )
+            log_message(f"load_project_local_config: env var {api_key_env!r} is not set; skipping api_key resolution")
     return data
 
 
@@ -384,8 +378,8 @@ def _config_source_files(
 
 _config_cache_lock = threading.Lock()
 _config_cache: Dict[
-    Tuple[Optional[str], Optional[str]],       # (cwd, session_name)
-    Tuple[DaemonConfig, Dict[str, float]],      # (resolved, {path: mtime})
+    Tuple[Optional[str], Optional[str]],  # (cwd, session_name)
+    Tuple[DaemonConfig, Dict[str, float]],  # (resolved, {path: mtime})
 ] = {}
 
 

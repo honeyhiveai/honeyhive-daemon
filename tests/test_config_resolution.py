@@ -19,7 +19,6 @@ from honeyhive_daemon.config import (
     load_project_local_config,
     load_user_config,
     resolve_config,
-    resolve_config_for_cwd,
     save_user_config,
 )
 
