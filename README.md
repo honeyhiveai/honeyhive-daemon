@@ -103,10 +103,13 @@ All daemon state lives under `~/.honeyhive/daemon/` (override with `HH_DAEMON_HO
 
 | Command | Description |
 |---------|-------------|
+| `honeyhive-daemon init` | Scaffold `.honeyhive/config.json` + `.honeyhive/config.local.json` in the current repo. |
 | `honeyhive-daemon run` | Start the daemon, install hooks, and flush queued events. |
 | `honeyhive-daemon stop` | Stop the running daemon. |
 | `honeyhive-daemon status` | Show config and pending spool event count. |
 | `honeyhive-daemon doctor` | Check that hooks and config are correctly installed. |
+| `honeyhive-daemon analyze` | Query HoneyHive traces for a time window and emit a JSON report of recurring error patterns. |
+| `honeyhive-daemon add-to-ci` | Generate a GitHub Actions workflow that runs `analyze` on a schedule and opens PRs for recurring patterns. |
 
 #### `run` options
 
@@ -117,6 +120,43 @@ All daemon state lives under `~/.honeyhive/daemon/` (override with `HH_DAEMON_HO
 | `--project` | `HH_PROJECT` | HoneyHive project name (default: repo/directory name). |
 | `--repo PATH` | | Git repo to attach commit events to. |
 | `--ci` | | Enable CI mode. |
+
+#### `analyze` options
+
+| Flag | Env var | Description |
+|------|---------|-------------|
+| `--project`, `-p` | `HH_PROJECT` | HoneyHive project name. Falls back to `.honeyhive/config.json`. |
+| `--since` | | Time window: `24h`, `7d`, `2w`. Default `24h`. |
+| `--out`, `-o` | | Output path (`-` for stdout). Default `-`. |
+| `--url` | `HH_API_URL` | HoneyHive base URL. |
+| `--key` | `HH_API_KEY` | HoneyHive API key. |
+
+Groups failed tool events into error patterns using `.honeyhive/error-categories.json` (per-repo rules; built-in defaults apply if the file is absent). Patterns with ≥ 3 occurrences are flagged as actionable; retry-loop sessions (same tool failing ≥ 5× in one session) are surfaced separately.
+
+```bash
+honeyhive-daemon analyze --since 7d --out patterns.json
+```
+
+#### `add-to-ci` options
+
+| Flag | Description |
+|------|-------------|
+| `--cadence` | `hourly` / `daily` / `weekly`. Default `daily`. |
+| `--project`, `-p` | HoneyHive project name. Falls back to `.honeyhive/config.json`. |
+| `--output-dir` | Where to write the workflow file. Default `.github/workflows/` in cwd. |
+
+Writes `.github/workflows/hh-proactive-improvements.yml` and scaffolds `.honeyhive/error-categories.json` if missing. The workflow runs `honeyhive-daemon analyze` on the chosen cadence, then invokes Claude Code to open PRs for any actionable patterns.
+
+```bash
+honeyhive-daemon add-to-ci --cadence weekly
+```
+
+After running, add these to your GitHub repo (Settings → Secrets and variables → Actions):
+
+- **Secrets:** `HH_API_KEY`, `ANTHROPIC_API_KEY`
+- **Variables:** `HH_API_URL` (optional; defaults to `https://api.honeyhive.ai`)
+
+Commit the generated workflow file and push. Trigger immediately with `gh workflow run hh-proactive-improvements.yml`.
 
 ### Troubleshooting
 
