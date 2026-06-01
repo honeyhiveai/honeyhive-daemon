@@ -25,6 +25,17 @@ _DAEMON_HOOK_ARGS = ("ingest", "claude-hook")
 _DAEMON_EXECUTABLE_NAMES = frozenset({"honeyhive-daemon", "honeyhive-daemon.exe"})
 
 
+def _strip_executable_quotes(executable: str) -> str:
+    """Strip matching surrounding quotes from a parsed executable path."""
+    if (
+        len(executable) >= 2
+        and executable[0] == executable[-1]
+        and executable[0] in ('"', "'")
+    ):
+        return executable[1:-1]
+    return executable
+
+
 def _split_hook_command(command: str) -> tuple[str, list[str]]:
     """Split a hook command string into executable and args."""
     text = command.strip()
@@ -36,14 +47,31 @@ def _split_hook_command(command: str) -> tuple[str, list[str]]:
         except ValueError:
             continue
         if parts:
-            return parts[0], parts[1:]
+            return _strip_executable_quotes(parts[0]), parts[1:]
     return "", []
+
+
+def _resolve_daemon_binary() -> str:
+    """Return the daemon binary path to register in Claude hook commands."""
+    if sys.argv:
+        candidate = Path(sys.argv[0]).resolve()
+        if candidate.name in _DAEMON_EXECUTABLE_NAMES and candidate.is_file():
+            return str(candidate)
+    resolved = shutil.which("honeyhive-daemon")
+    if resolved:
+        return resolved
+    return "honeyhive-daemon"
+
+
+def _executable_basename(executable: str) -> str:
+    """Return the final path segment, normalizing Windows separators."""
+    return Path(executable.replace("\\", "/")).name
 
 
 def _is_daemon_hook_command(command: str) -> bool:
     """True if *command* invokes this repo's Claude ingest hook."""
     executable, args = _split_hook_command(command)
-    if Path(executable).name not in _DAEMON_EXECUTABLE_NAMES:
+    if _executable_basename(executable) not in _DAEMON_EXECUTABLE_NAMES:
         return False
     return tuple(args) == _DAEMON_HOOK_ARGS
 
@@ -63,13 +91,7 @@ def get_hook_command() -> str:
     ``run``, so Claude Code hooks do not pick up a different install on PATH
     (e.g. a pyenv shim without the ``honeyhive`` dependency).
     """
-    resolved = shutil.which("honeyhive-daemon")
-    if not resolved and sys.argv:
-        candidate = Path(sys.argv[0]).resolve()
-        if candidate.name in _DAEMON_EXECUTABLE_NAMES:
-            resolved = str(candidate)
-    daemon_bin = resolved or "honeyhive-daemon"
-    return _format_hook_command(daemon_bin)
+    return _format_hook_command(_resolve_daemon_binary())
 
 
 def install_claude_hooks(settings_path: Path, command: str) -> bool:

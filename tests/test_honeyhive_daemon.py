@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -26,6 +27,7 @@ from honeyhive_daemon.state import (
 
 
 def test_get_hook_command_uses_resolved_binary(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["pytest"])
     monkeypatch.setattr(
         "honeyhive_daemon.claude_hooks.shutil.which",
         lambda _: "/opt/venv/bin/honeyhive-daemon",
@@ -36,7 +38,26 @@ def test_get_hook_command_uses_resolved_binary(monkeypatch) -> None:
     )
 
 
+def test_get_hook_command_prefers_argv_over_path(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Running ``run`` via absolute path must win over stale PATH entries."""
+    fresh_bin = tmp_path / "fresh" / "bin" / "honeyhive-daemon"
+    fresh_bin.parent.mkdir(parents=True)
+    fresh_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    fresh_bin.chmod(0o755)
+
+    monkeypatch.setattr(sys, "argv", [str(fresh_bin), "run"])
+    monkeypatch.setattr(
+        "honeyhive_daemon.claude_hooks.shutil.which",
+        lambda _: str(tmp_path / "stale" / "bin" / "honeyhive-daemon"),
+    )
+
+    assert get_hook_command() == f"{fresh_bin} ingest claude-hook"
+
+
 def test_get_hook_command_quotes_paths_with_spaces(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["pytest"])
     monkeypatch.setattr(
         "honeyhive_daemon.claude_hooks.shutil.which",
         lambda _: "/opt/my venv/bin/honeyhive-daemon",
@@ -54,9 +75,56 @@ def test_is_daemon_hook_command_recognizes_exe_and_rejects_wrappers() -> None:
     assert _is_daemon_hook_command(
         "/opt/venv/bin/honeyhive-daemon ingest claude-hook"
     )
+    assert _is_daemon_hook_command(
+        '"C:\\Program Files\\HoneyHive\\honeyhive-daemon.exe" ingest claude-hook'
+    )
     assert not _is_daemon_hook_command(
         "echo warmup && /opt/venv/bin/honeyhive-daemon ingest claude-hook"
     )
+
+
+def test_install_claude_hooks_idempotent_windows_quoted_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings_path = tmp_path / "settings.json"
+    quoted_cmd = (
+        '"C:\\Program Files\\HoneyHive\\honeyhive-daemon.exe" ingest claude-hook'
+    )
+    settings_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": quoted_cmd,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    changed = install_claude_hooks(settings_path, quoted_cmd)
+    changed_again = install_claude_hooks(settings_path, quoted_cmd)
+
+    data = json.loads(settings_path.read_text(encoding="utf-8"))
+    commands = [
+        hook["command"]
+        for entry in data["hooks"]["SessionStart"]
+        for hook in entry["hooks"]
+        if hook.get("type") == "command"
+    ]
+    assert changed is True
+    assert changed_again is False
+    assert commands.count(quoted_cmd) == 1
 
 
 def test_install_claude_hooks_replaces_legacy_bare_command(tmp_path: Path) -> None:
