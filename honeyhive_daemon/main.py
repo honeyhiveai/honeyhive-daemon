@@ -54,6 +54,10 @@ from .git_hooks import (
     get_commit_link_payload,
     install_post_commit_hook,
 )
+from .metrics import (
+    compute_session_metrics as _compute_session_metrics,
+    read_transcript_jsonl as _read_transcript_jsonl,
+)
 from .state import (
     append_chat_history,
     append_spool_event,
@@ -74,114 +78,6 @@ from .state import (
 
 SESSION_IDLE_THRESHOLD_MS = 24 * 60 * 60 * 1000
 ARTIFACT_MAX_RETRIES = 3
-
-
-def _compute_session_metrics(transcript_content: list) -> dict:
-    """Compute client-side metrics from a session transcript.
-
-    These are attached to the session event via PUT /events so they're
-    available for dashboards and evaluator filters without needing
-    server-side evaluators to re-parse the transcript.
-    """
-    tool_count = 0
-    model_count = 0
-    chain_count = 0
-    bash_count = 0
-    search_count = 0
-    permission_count = 0
-    subagent_starts = 0
-    subagent_stops = 0
-    has_errors = False
-    tool_categories: dict[str, int] = {}
-    total_input_tokens = 0
-    total_output_tokens = 0
-    total_cache_read_tokens = 0
-    total_cache_creation_tokens = 0
-
-    for record in transcript_content:
-        if not isinstance(record, dict):
-            continue
-
-        # Detect event type from transcript record
-        rtype = record.get("type", "")
-        hook_event = record.get("hook_event_name", "")
-
-        # Tool use records
-        if rtype in ("tool_use", "tool_result"):
-            tool_count += 1
-            tool_name = (record.get("tool_name") or record.get("name") or "").lower()
-            if tool_name in ("bash",):
-                bash_count += 1
-                tool_categories["bash"] = tool_categories.get("bash", 0) + 1
-            elif tool_name in ("read", "file_read"):
-                tool_categories["file_read"] = tool_categories.get("file_read", 0) + 1
-            elif tool_name in ("write", "file_write", "file_create"):
-                tool_categories["file_write"] = tool_categories.get("file_write", 0) + 1
-            elif tool_name in ("edit", "file_edit"):
-                tool_categories["file_edit"] = tool_categories.get("file_edit", 0) + 1
-            elif tool_name in ("glob", "grep", "file_search"):
-                search_count += 1
-                tool_categories["file_search"] = tool_categories.get("file_search", 0) + 1
-            elif tool_name in ("agent",):
-                tool_categories["agent"] = tool_categories.get("agent", 0) + 1
-            elif tool_name.startswith("mcp__"):
-                tool_categories["mcp"] = tool_categories.get("mcp", 0) + 1
-            else:
-                tool_categories["other"] = tool_categories.get("other", 0) + 1
-
-            if rtype == "tool_result" and record.get("is_error"):
-                has_errors = True
-
-        elif rtype in ("text", "thinking", "assistant"):
-            model_count += 1
-
-        # Aggregate token usage from records that carry it
-        usage = record.get("usage")
-        if isinstance(usage, dict):
-            total_input_tokens += int(usage.get("input_tokens", 0))
-            total_output_tokens += int(usage.get("output_tokens", 0))
-            total_cache_read_tokens += int(usage.get("cache_read_input_tokens", 0))
-            total_cache_creation_tokens += int(usage.get("cache_creation_input_tokens", 0))
-
-        # Notification records
-        if record.get("notification_type") == "permission_prompt":
-            permission_count += 1
-
-        # Subagent tracking
-        if hook_event == "SubagentStart":
-            subagent_starts += 1
-        elif hook_event == "SubagentStop":
-            subagent_stops += 1
-
-    total = tool_count + model_count + chain_count
-    metrics: dict[str, object] = {
-        "coding_agent.total_events": float(len(transcript_content)),
-        "coding_agent.tool_count": float(tool_count),
-        "coding_agent.model_count": float(model_count),
-        "coding_agent.unique_tools": float(len(tool_categories)),
-    }
-    if tool_count > 0:
-        metrics["coding_agent.bash_ratio"] = round(bash_count / tool_count, 3)
-        metrics["coding_agent.search_ratio"] = round(search_count / tool_count, 3)
-    if model_count > 0:
-        metrics["coding_agent.tool_model_ratio"] = round(tool_count / model_count, 2)
-    if total > 0:
-        metrics["coding_agent.permission_ratio"] = round(permission_count / total, 3)
-    metrics["coding_agent.has_errors"] = has_errors
-    total_tokens = total_input_tokens + total_output_tokens
-    if total_tokens > 0:
-        metrics["coding_agent.total_input_tokens"] = float(total_input_tokens)
-        metrics["coding_agent.total_output_tokens"] = float(total_output_tokens)
-        metrics["coding_agent.total_tokens"] = float(total_tokens)
-    if total_cache_read_tokens > 0:
-        metrics["coding_agent.total_cache_read_tokens"] = float(total_cache_read_tokens)
-    if total_cache_creation_tokens > 0:
-        metrics["coding_agent.total_cache_creation_tokens"] = float(total_cache_creation_tokens)
-    metrics["coding_agent.subagent_balanced"] = (
-        subagent_starts == 0 or subagent_starts == subagent_stops
-    )
-
-    return metrics
 
 
 @click.group()
@@ -689,10 +585,10 @@ def ingest_claude_hook() -> None:
     if turn_role and event.get("event_type") == "model":
         content = event.get("outputs", {}).get("content")
         if content is not None:
-            history_before = append_chat_history(
+            chat_history = append_chat_history(
                 str(event["session_id"]), turn_role, str(content)
             )
-            event.setdefault("inputs", {})["chat_history"] = history_before
+            event.setdefault("inputs", {})["chat_history"] = chat_history
 
     try:
         export_event(config, event)
@@ -879,6 +775,77 @@ def _flush_spool(config: DaemonConfig) -> None:
     log_message(f"flush complete flushed={flushed} remaining={len(failed)}")
 
 
+def _resolve_session_config(
+    session: dict, cli_defaults: DaemonConfig
+) -> DaemonConfig:
+    """Resolve the hierarchical config for a tracked session."""
+    cwd = session.get("cwd")
+    name = session.get("session_name")
+    if cwd or name:
+        return resolve_config(cwd=cwd, session_name=name, cli_defaults=cli_defaults)
+    return cli_defaults
+
+
+def _synthesize_session_end(
+    session: dict,
+    config: DaemonConfig,
+    transcript_path: str,
+) -> dict:
+    """Create and export a synthetic session.end for an orphaned session.
+
+    Returns the (possibly refreshed) session dict.
+    """
+    session_id = str(session["session_id"])
+    session_name = session.get("session_name")
+    cwd = session.get("cwd")
+
+    synthetic_end: dict = {
+        "event_id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "event_type": "chain",
+        "event_name": "session.end",
+        "start_time": int(session.get("last_activity_ms", _now_ms())),
+        "end_time": _now_ms(),
+        "duration": 0,
+        "inputs": {},
+        "outputs": {},
+        "parent_id": session_id,
+        "metadata": {
+            "agent.provider": "anthropic",
+            "agent.product": "claude-code",
+            "capture.source": "claude_hook",
+            "synthetic": True,
+            "synthetic.reason": "idle_timeout",
+        },
+    }
+    if session_name:
+        synthetic_end["metadata"]["session_name"] = session_name
+    if cwd:
+        synthetic_end["metadata"]["cwd"] = cwd
+
+    try:
+        export_event(config, synthetic_end)
+        record_session_activity(
+            session_id,
+            transcript_path=transcript_path,
+            last_activity_ms=_now_ms(),
+            ended=True,
+            session_end_event_id=synthetic_end["event_id"],
+        )
+        log_message(
+            "synthesized session.end for idle session "
+            f"session_id={session_id} "
+            f"session_name={session_name or '(unknown)'}"
+        )
+        return load_session_index().get(session_id, session)
+    except Exception as exc:
+        log_message(
+            f"failed to synthesize session.end "
+            f"session_id={session_id}: {exc}"
+        )
+        return session
+
+
 def _push_pending_session_artifacts(
     config: DaemonConfig, session_ids: Optional[list[str]] = None
 ) -> None:
@@ -896,69 +863,10 @@ def _push_pending_session_artifacts(
         if not transcript_path:
             continue
 
-        # Synthesize session.end for orphaned sessions (never received SessionEnd hook)
-        if not session.get("ended"):
-            synthetic_end = {
-                "event_id": str(uuid.uuid4()),
-                "session_id": str(session["session_id"]),
-                "event_type": "chain",
-                "event_name": "session.end",
-                "start_time": int(session.get("last_activity_ms", _now_ms())),
-                "end_time": _now_ms(),
-                "duration": 0,
-                "inputs": {},
-                "outputs": {},
-                "parent_id": str(session["session_id"]),
-                "metadata": {
-                    "agent.provider": "anthropic",
-                    "agent.product": "claude-code",
-                    "capture.source": "claude_hook",
-                    "synthetic": True,
-                    "synthetic.reason": "idle_timeout",
-                },
-            }
-            session_name = session.get("session_name")
-            if session_name:
-                synthetic_end["metadata"]["session_name"] = session_name
-            session_cwd_val = session.get("cwd")
-            if session_cwd_val:
-                synthetic_end["metadata"]["cwd"] = session_cwd_val
-            # Resolve config for export
-            synth_config = resolve_config(
-                cwd=session_cwd_val,
-                session_name=session_name,
-                cli_defaults=config,
-            ) if session_cwd_val or session_name else config
-            try:
-                export_event(synth_config, synthetic_end)
-                record_session_activity(
-                    str(session["session_id"]),
-                    transcript_path=transcript_path,
-                    last_activity_ms=_now_ms(),
-                    ended=True,
-                    session_end_event_id=synthetic_end["event_id"],
-                )
-                log_message(
-                    "synthesized session.end for idle session "
-                    f"session_id={session['session_id']} "
-                    f"session_name={session_name or '(unknown)'}"
-                )
-                # Re-read session state after marking ended
-                session = load_session_index().get(str(session["session_id"]), session)
-            except Exception as exc:
-                log_message(
-                    f"failed to synthesize session.end "
-                    f"session_id={session['session_id']}: {exc}"
-                )
+        session_config = _resolve_session_config(session, config)
 
-        # Resolve per-session config from stored cwd/session_name
-        session_cwd = session.get("cwd")
-        sess_name = session.get("session_name")
-        session_config = resolve_config(
-            cwd=session_cwd,
-            session_name=sess_name,
-            cli_defaults=config,
-        ) if session_cwd or sess_name else config
+        if not session.get("ended"):
+            session = _synthesize_session_end(session, session_config, transcript_path)
         transcript_content = _read_transcript_jsonl(transcript_path)
         if transcript_content is None:
             log_message(
@@ -1058,23 +966,6 @@ def _push_pending_session_artifacts(
                     "giving up on session artifact after max retries "
                     f"session_id={session['session_id']}"
                 )
-
-
-def _read_transcript_jsonl(transcript_path: str) -> Optional[list]:
-    """Read a JSONL transcript and return parsed JSON objects."""
-    path = Path(transcript_path)
-    if not path.exists() or not path.is_file():
-        return None
-    records: list = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return records if records else None
 
 
 def _settings_have_command(settings_path: Path) -> bool:

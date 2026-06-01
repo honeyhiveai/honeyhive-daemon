@@ -105,6 +105,16 @@ def _load_session_config(session_name: Optional[str]) -> Dict[str, Any]:
         return {}
 
 
+def _compute_duration(event: Dict[str, Any]) -> int:
+    """Return event duration, falling back to end_time - start_time when zero."""
+    explicit = int(event.get("duration", 0))
+    if explicit:
+        return explicit
+    start = int(event["start_time"])
+    end = int(event.get("end_time", start))
+    return max(0, end - start)
+
+
 def _build_event_payload(
     config: DaemonConfig, event: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -138,7 +148,7 @@ def _build_event_payload(
         "source": "claude-code",
         "start_time": int(event["start_time"]),
         "end_time": int(event.get("end_time", event["start_time"])),
-        "duration": int(event.get("duration", 0)) or max(0, int(event.get("end_time", event["start_time"])) - int(event["start_time"])),
+        "duration": _compute_duration(event),
         "inputs": inputs,
         "outputs": outputs,
         "metadata": metadata,

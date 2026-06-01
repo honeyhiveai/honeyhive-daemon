@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -305,7 +305,7 @@ class TestIssue2SyntheticSessionEnd:
 
 
 class TestIssue11SessionEndLogging:
-    """session.end export should produce a distinct log line."""
+    """session.end export should produce a distinct 'session ended' log line."""
 
     def test_session_end_export_logged(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -313,19 +313,34 @@ class TestIssue11SessionEndLogging:
         monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
 
         log_messages: list[str] = []
-        original_log = None
 
         def capture_log(message: str) -> None:
             log_messages.append(message)
 
         monkeypatch.setattr("honeyhive_daemon.main.log_message", capture_log)
+        monkeypatch.setattr("honeyhive_daemon.main.export_event", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            "honeyhive_daemon.main.resolve_config",
+            lambda **kw: kw.get("cli_defaults"),
+        )
 
-        # The existing code already logs "exported claude event event_name=session.end"
-        # This test verifies the log line is present
-        # (It's essentially testing the existing behavior is preserved)
-        capture_log("exported claude event event_name=session.end session_id=test")
+        from honeyhive_daemon.config import save_config, DaemonConfig
 
-        assert any("session.end" in msg and "exported" in msg for msg in log_messages)
+        save_config(DaemonConfig(
+            api_key="hh_test", base_url="https://api.honeyhive.ai", project="demo",
+        ))
+
+        session_end_payload = json.dumps({
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-log-test",
+            "event": {"event_id": "evt-log-test"},
+        })
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["ingest", "claude-hook"], input=session_end_payload)
+        assert result.exit_code == 0, result.output
+
+        assert any("session ended" in msg and "sess-log-test" in msg for msg in log_messages)
 
 
 # ===========================================================================
