@@ -161,14 +161,26 @@ def get_chat_history(session_id: str) -> List[Dict[str, str]]:
 def append_chat_history(
     session_id: str, role: str, content: str
 ) -> List[Dict[str, str]]:
-    """Append a message to a session's chat history and return the history before appending."""
+    """Append a message to a session's chat history and return the history including the new message."""
     index = _load_chat_histories()
     history = list(index.get(session_id, []))
-    history_before = list(history)
     history.append({"role": role, "content": content})
     index[session_id] = history
     _save_chat_histories(index)
-    return history_before
+    return list(history)
+
+
+def increment_session_artifact_retry(session_id: str) -> int:
+    """Increment and return the artifact retry count for a session."""
+    index = load_session_index()
+    session = index.get(session_id)
+    if session is None:
+        return 0
+    count = session.get("artifact_retry_count", 0) + 1
+    session["artifact_retry_count"] = count
+    index[session_id] = session
+    save_session_index(index)
+    return count
 
 
 def _load_pending_tools() -> Dict[str, Dict[str, Any]]:

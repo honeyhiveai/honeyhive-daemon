@@ -61,6 +61,8 @@ from .state import (
     buffer_pending_tool_event,
     get_expired_tool_events,
     get_sessions_needing_artifact,
+    increment_session_artifact_retry,
+    load_session_index,
     log_message,
     mark_session_artifact_pushed,
     pop_pending_tool_event,
@@ -71,6 +73,7 @@ from .state import (
 
 
 SESSION_IDLE_THRESHOLD_MS = 24 * 60 * 60 * 1000
+ARTIFACT_MAX_RETRIES = 3
 
 
 def _compute_session_metrics(transcript_content: list) -> dict:
@@ -90,6 +93,10 @@ def _compute_session_metrics(transcript_content: list) -> dict:
     subagent_stops = 0
     has_errors = False
     tool_categories: dict[str, int] = {}
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_cache_read_tokens = 0
+    total_cache_creation_tokens = 0
 
     for record in transcript_content:
         if not isinstance(record, dict):
@@ -125,8 +132,16 @@ def _compute_session_metrics(transcript_content: list) -> dict:
             if rtype == "tool_result" and record.get("is_error"):
                 has_errors = True
 
-        elif rtype in ("text", "thinking"):
+        elif rtype in ("text", "thinking", "assistant"):
             model_count += 1
+
+        # Aggregate token usage from records that carry it
+        usage = record.get("usage")
+        if isinstance(usage, dict):
+            total_input_tokens += int(usage.get("input_tokens", 0))
+            total_output_tokens += int(usage.get("output_tokens", 0))
+            total_cache_read_tokens += int(usage.get("cache_read_input_tokens", 0))
+            total_cache_creation_tokens += int(usage.get("cache_creation_input_tokens", 0))
 
         # Notification records
         if record.get("notification_type") == "permission_prompt":
@@ -153,6 +168,15 @@ def _compute_session_metrics(transcript_content: list) -> dict:
     if total > 0:
         metrics["coding_agent.permission_ratio"] = round(permission_count / total, 3)
     metrics["coding_agent.has_errors"] = has_errors
+    total_tokens = total_input_tokens + total_output_tokens
+    if total_tokens > 0:
+        metrics["coding_agent.total_input_tokens"] = float(total_input_tokens)
+        metrics["coding_agent.total_output_tokens"] = float(total_output_tokens)
+        metrics["coding_agent.total_tokens"] = float(total_tokens)
+    if total_cache_read_tokens > 0:
+        metrics["coding_agent.total_cache_read_tokens"] = float(total_cache_read_tokens)
+    if total_cache_creation_tokens > 0:
+        metrics["coding_agent.total_cache_creation_tokens"] = float(total_cache_creation_tokens)
     metrics["coding_agent.subagent_balanced"] = (
         subagent_starts == 0 or subagent_starts == subagent_stops
     )
@@ -364,7 +388,8 @@ def run(
 @cli.command()
 @click.option("--project", "-p", required=True, help="HoneyHive project name")
 @click.option("--api-key-env", default="HH_API_KEY", help="Env var holding the API key")
-def init(project: str, api_key_env: str) -> None:
+@click.option("--url", default=None, help="HoneyHive API base URL (for self-hosted / non-default endpoints)")
+def init(project: str, api_key_env: str, url: str | None) -> None:
     """Initialize .honeyhive/ config in the current directory."""
     cwd = Path.cwd()
     hh_dir = cwd / ".honeyhive"
@@ -382,9 +407,12 @@ def init(project: str, api_key_env: str) -> None:
     )
 
     # Write local config (not committed)
+    local_config: dict[str, str] = {"api_key_env": api_key_env}
+    if url:
+        local_config["base_url"] = url
     local_config_path = hh_dir / "config.local.json"
     local_config_path.write_text(
-        json.dumps({"api_key_env": api_key_env}, indent=2) + "\n",
+        json.dumps(local_config, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -415,10 +443,18 @@ def init(project: str, api_key_env: str) -> None:
 def status() -> None:
     """Show daemon status."""
     config = load_config()
-    pending = len(read_spool_events())
+    spool_events = read_spool_events()
+    pending = len(spool_events)
     click.echo(f"Daemon home: {get_daemon_home()}")
     click.echo(f"Configured: {'yes' if config else 'no'}")
     click.echo(f"Pending spool events: {pending}")
+    if pending > 0:
+        reasons: dict[str, int] = {}
+        for evt in spool_events:
+            reason = evt.get("spool_reason", "unknown")
+            reasons[reason] = reasons.get(reason, 0) + 1
+        for reason, count in reasons.items():
+            click.echo(f"  Spool reason ({count}x): {reason}")
     if config:
         click.echo(f"Project: {config.project}")
         click.echo(f"Base URL: {config.base_url}")
@@ -665,6 +701,12 @@ def ingest_claude_hook() -> None:
             f"event_name={event['event_name']} "
             f"session_id={event['session_id']}"
         )
+        if event["event_name"] == "session.end":
+            log_message(
+                "session ended "
+                f"session_id={event['session_id']} "
+                f"event_id={event['event_id']}"
+            )
         # Artifact push is handled by the daemon's background loop
         # (every 5s) rather than inline here, to avoid hook timeouts.
     except Exception as exc:  # pragma: no cover
@@ -853,6 +895,62 @@ def _push_pending_session_artifacts(
         transcript_path = session.get("transcript_path")
         if not transcript_path:
             continue
+
+        # Synthesize session.end for orphaned sessions (never received SessionEnd hook)
+        if not session.get("ended"):
+            synthetic_end = {
+                "event_id": str(uuid.uuid4()),
+                "session_id": str(session["session_id"]),
+                "event_type": "chain",
+                "event_name": "session.end",
+                "start_time": int(session.get("last_activity_ms", _now_ms())),
+                "end_time": _now_ms(),
+                "duration": 0,
+                "inputs": {},
+                "outputs": {},
+                "parent_id": str(session["session_id"]),
+                "metadata": {
+                    "agent.provider": "anthropic",
+                    "agent.product": "claude-code",
+                    "capture.source": "claude_hook",
+                    "synthetic": True,
+                    "synthetic.reason": "idle_timeout",
+                },
+            }
+            session_name = session.get("session_name")
+            if session_name:
+                synthetic_end["metadata"]["session_name"] = session_name
+            session_cwd_val = session.get("cwd")
+            if session_cwd_val:
+                synthetic_end["metadata"]["cwd"] = session_cwd_val
+            # Resolve config for export
+            synth_config = resolve_config(
+                cwd=session_cwd_val,
+                session_name=session_name,
+                cli_defaults=config,
+            ) if session_cwd_val or session_name else config
+            try:
+                export_event(synth_config, synthetic_end)
+                record_session_activity(
+                    str(session["session_id"]),
+                    transcript_path=transcript_path,
+                    last_activity_ms=_now_ms(),
+                    ended=True,
+                    session_end_event_id=synthetic_end["event_id"],
+                )
+                log_message(
+                    "synthesized session.end for idle session "
+                    f"session_id={session['session_id']} "
+                    f"session_name={session_name or '(unknown)'}"
+                )
+                # Re-read session state after marking ended
+                session = load_session_index().get(str(session["session_id"]), session)
+            except Exception as exc:
+                log_message(
+                    f"failed to synthesize session.end "
+                    f"session_id={session['session_id']}: {exc}"
+                )
+
         # Resolve per-session config from stored cwd/session_name
         session_cwd = session.get("cwd")
         sess_name = session.get("session_name")
@@ -948,10 +1046,18 @@ def _push_pending_session_artifacts(
                 f"reason={reason}"
             )
         except Exception as exc:  # pragma: no cover
+            retry_count = increment_session_artifact_retry(session["session_id"])
             log_message(
                 "failed session artifact update "
-                f"session_id={session['session_id']}: {exc}"
+                f"session_id={session['session_id']} "
+                f"retry={retry_count}/{ARTIFACT_MAX_RETRIES}: {exc}"
             )
+            if retry_count >= ARTIFACT_MAX_RETRIES:
+                mark_session_artifact_pushed(session["session_id"], _now_ms())
+                log_message(
+                    "giving up on session artifact after max retries "
+                    f"session_id={session['session_id']}"
+                )
 
 
 def _read_transcript_jsonl(transcript_path: str) -> Optional[list]:

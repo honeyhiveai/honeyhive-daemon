@@ -32,12 +32,10 @@ A local daemon that captures Claude Code activity via hooks and exports structur
 pip install honeyhive-daemon
 
 # In your project repo
-honeyhive-daemon init --project my-project
+honeyhive-daemon init --project my-project --url https://api.dp1.us.prod.honeyhive.ai
 # Creates .honeyhive/config.json and .honeyhive/config.local.json
-# Edit .honeyhive/config.local.json to set your api_key_env
 
 export HH_API_KEY=your-key
-export HH_API_URL=https://api.dp1.us.prod.honeyhive.ai
 
 honeyhive-daemon run
 ```
@@ -52,9 +50,21 @@ The daemon stores local state in `~/.honeyhive/daemon/` and installs Claude hook
 
 ### Running in the background
 
+**Important:** The daemon must stay running while you use Claude Code _and_ for a few seconds afterward. The daemon's background loop (every 5s) handles:
+
+- Flushing spooled events that failed to export
+- Pushing session artifacts (transcript + chat history) after a session ends
+- Synthesizing `session.end` for sessions that exit without a clean SessionEnd hook (e.g. Ctrl+C)
+- Computing and attaching session metrics (model count, tool count, token usage)
+
+If you kill the daemon immediately after Claude exits, pending artifacts and retries may be lost. Give it ~10s after your last Claude session ends.
+
 ```bash
-# Leave this terminal open while using Claude Code
+# Recommended: run in a dedicated terminal or tmux session
 honeyhive-daemon run
+
+# Or in tmux:
+tmux new-session -d -s honeyhive 'honeyhive-daemon run'
 ```
 
 To stop it:
@@ -63,7 +73,7 @@ To stop it:
 honeyhive-daemon stop
 ```
 
-`stop` sends SIGTERM to the running daemon via its PID file (`~/.honeyhive/daemon/daemon.pid`). Only one instance can run at a time — attempting to start a second will print an error and exit.
+`stop` sends SIGTERM to the running daemon via its PID file (`~/.honeyhive/daemon/daemon.pid`). The daemon flushes any remaining spooled events before exiting. Only one instance can run at a time — attempting to start a second will print an error and exit.
 
 ### Events
 
@@ -107,10 +117,10 @@ All daemon state lives under `~/.honeyhive/daemon/` (override with `HH_DAEMON_HO
 
 | Command | Description |
 |---------|-------------|
-| `honeyhive-daemon init` | Scaffold `.honeyhive/config.json` + `.honeyhive/config.local.json` in the current repo. |
+| `honeyhive-daemon init` | Scaffold `.honeyhive/config.json` + `.honeyhive/config.local.json` in the current repo. Accepts `--url` to persist a custom API endpoint. |
 | `honeyhive-daemon run` | Start the daemon, install hooks, and flush queued events. |
 | `honeyhive-daemon stop` | Stop the running daemon. |
-| `honeyhive-daemon status` | Show config and pending spool event count. |
+| `honeyhive-daemon status` | Show config, pending spool event count, and failure reasons for spooled events. |
 | `honeyhive-daemon doctor` | Check that hooks and config are correctly installed. |
 | `honeyhive-daemon analyze` | Query HoneyHive traces for a time window and emit a JSON report of recurring error patterns. |
 | `honeyhive-daemon add-to-ci` | Generate a GitHub Actions workflow that runs `analyze` on a schedule and opens PRs for recurring patterns. |

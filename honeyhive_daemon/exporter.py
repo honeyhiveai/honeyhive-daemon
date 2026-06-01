@@ -138,7 +138,7 @@ def _build_event_payload(
         "source": "claude-code",
         "start_time": int(event["start_time"]),
         "end_time": int(event.get("end_time", event["start_time"])),
-        "duration": int(event.get("duration", 0)),
+        "duration": int(event.get("duration", 0)) or max(0, int(event.get("end_time", event["start_time"])) - int(event["start_time"])),
         "inputs": inputs,
         "outputs": outputs,
         "metadata": metadata,
