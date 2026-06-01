@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -33,14 +34,13 @@ def compute_session_metrics(transcript_content: list) -> dict:
     """
     tool_count = 0
     model_count = 0
-    chain_count = 0
     bash_count = 0
     search_count = 0
     permission_count = 0
     subagent_starts = 0
     subagent_stops = 0
     has_errors = False
-    tool_categories: dict[str, int] = {}
+    tool_categories: dict[str, int] = defaultdict(int)
     total_input_tokens = 0
     total_output_tokens = 0
     total_cache_read_tokens = 0
@@ -50,32 +50,30 @@ def compute_session_metrics(transcript_content: list) -> dict:
         if not isinstance(record, dict):
             continue
 
-        # Detect event type from transcript record
         rtype = record.get("type", "")
         hook_event = record.get("hook_event_name", "")
 
-        # Tool use records
         if rtype in ("tool_use", "tool_result"):
             tool_count += 1
             tool_name = (record.get("tool_name") or record.get("name") or "").lower()
             if tool_name in ("bash",):
                 bash_count += 1
-                tool_categories["bash"] = tool_categories.get("bash", 0) + 1
+                tool_categories["bash"] += 1
             elif tool_name in ("read", "file_read"):
-                tool_categories["file_read"] = tool_categories.get("file_read", 0) + 1
+                tool_categories["file_read"] += 1
             elif tool_name in ("write", "file_write", "file_create"):
-                tool_categories["file_write"] = tool_categories.get("file_write", 0) + 1
+                tool_categories["file_write"] += 1
             elif tool_name in ("edit", "file_edit"):
-                tool_categories["file_edit"] = tool_categories.get("file_edit", 0) + 1
+                tool_categories["file_edit"] += 1
             elif tool_name in ("glob", "grep", "file_search"):
                 search_count += 1
-                tool_categories["file_search"] = tool_categories.get("file_search", 0) + 1
+                tool_categories["file_search"] += 1
             elif tool_name in ("agent",):
-                tool_categories["agent"] = tool_categories.get("agent", 0) + 1
+                tool_categories["agent"] += 1
             elif tool_name.startswith("mcp__"):
-                tool_categories["mcp"] = tool_categories.get("mcp", 0) + 1
+                tool_categories["mcp"] += 1
             else:
-                tool_categories["other"] = tool_categories.get("other", 0) + 1
+                tool_categories["other"] += 1
 
             if rtype == "tool_result" and record.get("is_error"):
                 has_errors = True
@@ -83,7 +81,6 @@ def compute_session_metrics(transcript_content: list) -> dict:
         elif rtype in ("text", "thinking", "assistant"):
             model_count += 1
 
-        # Aggregate token usage from records that carry it
         usage = record.get("usage")
         if isinstance(usage, dict):
             total_input_tokens += int(usage.get("input_tokens", 0))
@@ -91,17 +88,15 @@ def compute_session_metrics(transcript_content: list) -> dict:
             total_cache_read_tokens += int(usage.get("cache_read_input_tokens", 0))
             total_cache_creation_tokens += int(usage.get("cache_creation_input_tokens", 0))
 
-        # Notification records
         if record.get("notification_type") == "permission_prompt":
             permission_count += 1
 
-        # Subagent tracking
         if hook_event == "SubagentStart":
             subagent_starts += 1
         elif hook_event == "SubagentStop":
             subagent_stops += 1
 
-    total = tool_count + model_count + chain_count
+    total = tool_count + model_count
     metrics: dict[str, object] = {
         "coding_agent.total_events": float(len(transcript_content)),
         "coding_agent.tool_count": float(tool_count),

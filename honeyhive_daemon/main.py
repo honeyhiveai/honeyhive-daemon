@@ -899,41 +899,28 @@ def _push_pending_session_artifacts(
                 "reason": reason,
             }
         }
-        # Session root (session.start) gets only chat_history
+        session_start_id = str(session["event_id"])
+        session_end_id = session.get("session_end_event_id")
         chat_history = get_chat_history(session["session_id"])
-        session_root_outputs = {}
-        if chat_history:
-            session_root_outputs["chat_history"] = chat_history
-
-        # Session end gets the full artifact transcript
-        target_event_ids = [str(session["event_id"])]
-        session_end_event_id = session.get("session_end_event_id")
-        if session_end_event_id and session_end_event_id not in target_event_ids:
-            target_event_ids.append(str(session_end_event_id))
         try:
-            for event_id in target_event_ids:
-                if event_id == str(session["event_id"]):
-                    # session.start root event — only chat history
-                    if session_root_outputs:
-                        update_event_outputs(
-                            session_config,
-                            event_id=event_id,
-                            outputs=session_root_outputs,
-                        )
-                else:
-                    # session.end event — full artifact transcript
-                    update_event_outputs(
-                        session_config,
-                        event_id=event_id,
-                        outputs=artifact_outputs,
-                    )
-            # Compute and attach client-side metrics to the session root event
+            if chat_history:
+                update_event_outputs(
+                    session_config,
+                    event_id=session_start_id,
+                    outputs={"chat_history": chat_history},
+                )
+            if session_end_id:
+                update_event_outputs(
+                    session_config,
+                    event_id=str(session_end_id),
+                    outputs=artifact_outputs,
+                )
             session_metrics = _compute_session_metrics(transcript_content)
             if session_metrics:
                 try:
                     update_event(
                         session_config,
-                        event_id=str(session["event_id"]),
+                        event_id=session_start_id,
                         metrics=session_metrics,
                     )
                     log_message(
