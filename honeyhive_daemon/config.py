@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-DEFAULT_BASE_URL = "https://api.honeyhive.ai"
+DEFAULT_BASE_URL = "https://api.dp1.us.prod.honeyhive.ai"
 
 
 @dataclass

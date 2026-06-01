@@ -36,7 +36,10 @@ honeyhive-daemon init --project my-project
 # Creates .honeyhive/config.json and .honeyhive/config.local.json
 # Edit .honeyhive/config.local.json to set your api_key_env
 
-HH_API_KEY=your-key honeyhive-daemon run
+export HH_API_KEY=your-key
+export HH_API_URL=https://api.dp1.us.prod.honeyhive.ai
+
+honeyhive-daemon run
 ```
 
 **Single-project (legacy):**
@@ -50,7 +53,8 @@ The daemon stores local state in `~/.honeyhive/daemon/` and installs Claude hook
 ### Running in the background
 
 ```bash
-honeyhive-daemon run --key $HH_API_KEY --url $HH_API_URL &
+# Leave this terminal open while using Claude Code
+honeyhive-daemon run
 ```
 
 To stop it:
@@ -116,7 +120,7 @@ All daemon state lives under `~/.honeyhive/daemon/` (override with `HH_DAEMON_HO
 | Flag | Env var | Description |
 |------|---------|-------------|
 | `--key` | `HH_API_KEY` | HoneyHive API key (required). |
-| `--url` | `HH_API_URL` | HoneyHive base URL (default: `https://api.honeyhive.ai`). |
+| `--url` | `HH_API_URL` | Data plane URL (default: `https://api.dp1.us.prod.honeyhive.ai`). |
 | `--project` | `HH_PROJECT` | HoneyHive project name (default: repo/directory name). |
 | `--repo PATH` | | Git repo to attach commit events to. |
 | `--ci` | | Enable CI mode. |
@@ -154,7 +158,7 @@ honeyhive-daemon add-to-ci --cadence weekly
 After running, add these to your GitHub repo (Settings → Secrets and variables → Actions):
 
 - **Secrets:** `HH_API_KEY`, `ANTHROPIC_API_KEY`
-- **Variables:** `HH_API_URL` (optional; defaults to `https://api.honeyhive.ai`)
+- **Variables:** `HH_API_URL` (optional; defaults to `https://api.dp1.us.prod.honeyhive.ai`)
 
 Commit the generated workflow file and push. Trigger immediately with `gh workflow run hh-proactive-improvements.yml`.
 
