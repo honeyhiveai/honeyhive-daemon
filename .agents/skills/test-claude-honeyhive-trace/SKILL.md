@@ -1,0 +1,171 @@
+---
+name: test-claude-honeyhive-trace
+description: Run a real Claude Code session through honeyhive-daemon, verify HoneyHive export, and triage failures into daemon/skill fixes. Use when validating telemetry, regressions, or blog-launch readiness.
+---
+
+# Test Claude Code → HoneyHive trace
+
+**Purpose:** exercise the real path (tmux daemon + `claude -p`), compare logs and API export to expectations, and **fix what breaks** — in `honeyhive-daemon`, hooks, or this skill. A green checklist is not the goal; surfacing and resolving gaps is.
+
+Agent-only. No wrapper scripts. Daemon in **detached tmux**; Claude via **`claude -p`**.
+
+## Prerequisites
+
+- Claude Code CLI (`claude`) authenticated
+- `tmux`
+- `HH_API_KEY`, `HH_API_URL` (or `.env` to source)
+- `honeyhive-daemon` + `honeyhive` in the **same** Python as the `honeyhive-daemon` on PATH
+- HoneyHive CLI (`honeyhive`) on PATH — [install guide](https://honeyhiveai.github.io/honeyhive-cli/); not a Python shim named `honeyhive`
+
+```bash
+python -c "import honeyhive"
+which honeyhive-daemon
+which honeyhive
+file "$(which honeyhive-daemon)" "$(which honeyhive)"
+```
+
+## Gotchas
+
+- **Hooks use PATH** — install daemon into the interpreter that owns `honeyhive-daemon`.
+- **Daemon before `claude -p`** — otherwise `session_name=(unknown)`.
+- **Never `run &` in a one-shot shell** — detached tmux only.
+- **No `--bare`** — skips hooks.
+- **Let `claude -p` finish** — do not Ctrl+C; abrupt exit drops `session.end`.
+- **`SessionEnd hook ... Hook cancelled` on stderr** — common in print mode; wait `sleep 12` and trust `daemon.log` + API, not stderr alone.
+- **Artifact flush is async** — daemon loop ~5s; wait 12s before declaring failure.
+- **Re-run `run` in tmux after upgrading** — refreshes absolute hook path in `~/.claude/settings.json`.
+
+## Workflow
+
+### 1. Install daemon
+
+```bash
+cd <honeyhive-daemon-repo>
+pip install -e .    # or: uv pip install -e .
+```
+
+### 2. Load credentials
+
+```bash
+set -a && source /path/to/.env && set +a
+```
+
+No `init` step.
+
+### 3. Start daemon (detached tmux)
+
+```bash
+WORKDIR=/path/to/workdir
+tmux kill-session -t honeyhive 2>/dev/null || true
+tmux new-session -d -s honeyhive bash -lc "
+  set -a && source /path/to/.env && set +a
+  cd \"$WORKDIR\"
+  exec honeyhive-daemon run --url \"\$HH_API_URL\"
+"
+sleep 2
+honeyhive-daemon status
+honeyhive-daemon doctor
+```
+
+Optional: `HH_DAEMON_HOME` in the tmux block for isolated state.
+
+Cleanup: `honeyhive-daemon stop` or `tmux kill-session -t honeyhive`.
+
+### 4. Run Claude (print mode)
+
+```bash
+cd "$WORKDIR"
+claude -p "Reply with exactly: honeyhive smoke ok"
+```
+
+Tool-free prompt avoids permission blocks. Add `--allowed-tools` or sandbox flags only if you intentionally test tools.
+
+### 5. Flush and capture session id
+
+```bash
+sleep 12
+LOG="${HH_DAEMON_HOME:-$HOME/.honeyhive/daemon}/daemon.log"
+
+# Prefer the session from this run's artifact line (tail -5 on session_id= hits stale failures)
+SESSION=$(grep 'updated session artifact' "$LOG" | grep 'reason=session_end' | tail -1 \
+  | sed -n 's/.*session_id=\([^ ]*\).*/\1/p')
+# Fallback only if primary is empty — on a busy machine this tail is often an *older*
+# session, not the smoke run you just did. Do not use fallback when primary matched.
+[ -z "$SESSION" ] && SESSION=$(grep 'exported claude event' "$LOG" | grep 'event_name=session.start' | tail -1 \
+  | sed -n 's/.*session_id=\([^ ]*\).*/\1/p')
+echo "SESSION=$SESSION"
+```
+
+### 6. Verify logs
+
+```bash
+honeyhive-daemon status
+grep "$SESSION" "$LOG" | grep -E 'exported|artifact|session\.end|spooled|fail'
+```
+
+Expect: `exported claude event`; `updated session artifact` with `session_end`; no `spooled claude event` for `$SESSION`.
+
+### 7. Fetch events (HoneyHive CLI)
+
+Use `--data-plane-url` (not deprecated `--base-url`). If `.env` sets `HH_API_URL`, the CLI may still print a **deprecation warning** on stderr — ignore it when exit code is 0.
+
+```bash
+honeyhive events search \
+  --data-plane-url "$HH_API_URL" \
+  --filters "[{\"field\":\"session_id\",\"value\":\"$SESSION\",\"operator\":\"is\",\"type\":\"string\"}]" \
+  --limit 50 \
+  > session_export.json
+
+python3 -c "
+import json
+d=json.load(open('session_export.json'))
+for e in sorted(d.get('events',[]), key=lambda x: x.get('start_time',0)):
+    print(e.get('event_name'), e.get('event_type'))
+print('count:', len(d.get('events',[])))
+"
+```
+
+### 8. Triage — fix issues, don’t only report PASS
+
+For each checklist miss or log/API anomaly:
+
+1. **Reproduce** — note `SESSION`, relevant `daemon.log` lines, spool file, CLI export snippet.
+2. **Classify** — export/spool, hooks/PATH, `session.end`/artifact, metrics/UI, skill doc wrong.
+3. **Fix in repo** when the bug is in daemon/mappings/exporter (add or extend tests if the fix is non-trivial).
+4. **Update this skill** if the workflow was wrong (commands, waits, session-id extraction).
+5. **Re-run** steps 3–7 until checklist passes or file a tracked issue with evidence.
+
+**Known gaps to watch for** (from prior runs; fix when reproduced):
+
+| Gap | Where to look |
+|-----|----------------|
+| `session.end` missing after `claude -p` | Hook timeout, daemon not running, stderr “Hook cancelled” + no artifact after 12s |
+| Spool never drains | `grep -E 'spool|validation|error' "$LOG"`; SDK version vs `pyproject.toml` |
+| Artifact 400 retries | Stale `state/sessions.json`; cap retries in daemon |
+| `total_tokens` / cost 0 in UI | `metadata.prompt_tokens` on turns — daemon vs backend |
+| `coding_agent.model_count` 0 | `_compute_session_metrics` / transcript parser |
+
+Record fixes: commit on a branch, or short note in the task (issue id + session uuid).
+
+## Pass checklist
+
+- [ ] Spool empty (`status` + `spool/events.jsonl`)
+- [ ] `session.start`, `turn.user`, `turn.agent` (and `tool.*` if testing tools)
+- [ ] `session.end` in CLI export
+- [ ] Transcript: `session.end` → `outputs.artifact` and/or `session.start` → `chat_history`
+
+If anything fails, **do not stop at FAIL** — follow §8 and land a fix or a filed issue with reproduction.
+
+## Common failures
+
+| Symptom | Likely cause | What to do |
+|--------|----------------|------------|
+| `No module named 'honeyhive'` in hook | Wrong `honeyhive-daemon` on PATH | `pip install -e .`; restart tmux `run` |
+| Events stuck in spool | SDK/API errors | Fix exporter; grep `daemon.log` |
+| `session.end` missing | Daemon died, killed `claude`, or insufficient wait | tmux `run`; `claude -p`; `sleep 12`; check artifact line |
+| stderr `SessionEnd hook ... cancelled` | Print-mode race | Wait 12s; verify artifact + API anyway |
+| `failed session artifact update` for old uuid | Stale state | Use SESSION from latest `session_end` artifact line |
+| CLI URL flag error | Deprecated flag | `--data-plane-url "$HH_API_URL"` |
+| CLI stderr: `HH_API_URL` deprecated | Env name legacy; flag is correct | Non-zero exit only is failure; search can still succeed |
+| Wrong events in export | Used fallback session id on busy log | Prefer primary `session_end` artifact line; verify `SESSION` matches this run’s log lines |
+| UI 0 total tokens | Missing rollup fields | Inspect event metadata; fix daemon or document backend gap |

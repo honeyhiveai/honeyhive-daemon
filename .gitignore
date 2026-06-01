@@ -5,14 +5,7 @@ __pycache__/
 .venv/
 dist/
 
-# Data files - never commit or package these
-*.json
-!pyproject.toml
-!**/evals.json
-!**/eval_metadata.json
-skills/
-.claude/settings.local.json
-.playwright-mcp/
+# Local export / eval artifacts (never commit)
 exported_events.json
 sampled_sessions.json
 session_ids.json
@@ -21,4 +14,10 @@ session_topics.json
 trajectory_summaries.json
 eval_*.json
 eval_results_*.json
+session_export*.json
+session_export_cli.err
 update_event_api.txt
+
+.claude/settings.local.json
+.playwright-mcp/
+.cursor/

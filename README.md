@@ -169,7 +169,7 @@ If events aren't showing up in HoneyHive, work through these checks in order:
 5. **Spool buildup?** `wc -l ~/.honeyhive/daemon/spool/events.jsonl` — if events are piling up, check the `spool_reason` field for error details.
 6. **PATH issues.** Ensure `honeyhive-daemon` is on PATH in the shell context Claude Code uses (`which honeyhive-daemon`). Virtualenv installations may not be visible to hooks.
 
-A detailed troubleshooting guide is available in [`skills/honeyhive-daemon-debug/SKILL.md`](skills/honeyhive-daemon-debug/SKILL.md).
+Agent smoke-test workflow: [`.agents/skills/test-claude-honeyhive-trace/SKILL.md`](.agents/skills/test-claude-honeyhive-trace/SKILL.md).
 
 ### Evaluators
 
