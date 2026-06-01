@@ -302,6 +302,11 @@ def test_cli_status_without_config(monkeypatch, tmp_path: Path) -> None:
     assert "Configured: no" in result.output
 
 
+def _nested_event_dict(request) -> dict:  # type: ignore[no-untyped-def]
+    event = request.event
+    return event.model_dump() if hasattr(event, "model_dump") else event
+
+
 def test_export_session_event_includes_session_name(monkeypatch, tmp_path: Path) -> None:
     """session_name is promoted to a top-level field on session events."""
     captured = {}
@@ -309,7 +314,7 @@ def test_export_session_event_includes_session_name(monkeypatch, tmp_path: Path)
 
     class FakeEventsAPI:
         def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
-            captured["event"] = request.event
+            captured["event"] = _nested_event_dict(request)
 
     class FakeHoneyHive:
         def __init__(self, api_key: str, base_url: str) -> None:
@@ -349,7 +354,7 @@ def test_export_tool_event_no_session_name_field(monkeypatch, tmp_path: Path) ->
 
     class FakeEventsAPI:
         def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
-            captured["event"] = request.event
+            captured["event"] = _nested_event_dict(request)
 
     class FakeHoneyHive:
         def __init__(self, api_key: str, base_url: str) -> None:
@@ -389,7 +394,7 @@ def test_export_event_posts_honeyhive_event(monkeypatch, tmp_path: Path) -> None
 
     class FakeEventsAPI:
         def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
-            captured["event"] = request.event
+            captured["event"] = _nested_event_dict(request)
 
     class FakeHoneyHive:
         def __init__(self, api_key: str, base_url: str) -> None:

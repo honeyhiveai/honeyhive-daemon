@@ -11,13 +11,13 @@ from .state import log_message
 
 try:
     from honeyhive import HoneyHive
-    from honeyhive._generated.models import PostEventRequest
+    from honeyhive.models.models import PostEventRequest, UpdateEventRequest
 except ImportError:  # pragma: no cover - exercised in local repo usage
     sdk_src = Path(__file__).resolve().parents[2] / "python-sdk" / "src"
     if str(sdk_src) not in sys.path:
         sys.path.insert(0, str(sdk_src))
     from honeyhive import HoneyHive
-    from honeyhive._generated.models import PostEventRequest
+    from honeyhive.models.models import PostEventRequest, UpdateEventRequest
 
 
 def export_event(config: DaemonConfig, event: Dict[str, Any]) -> None:
@@ -71,8 +71,9 @@ def update_event(
         data["outputs"] = outputs
     if metrics is not None:
         data["metrics"] = metrics
+
     client = HoneyHive(api_key=config.api_key, base_url=config.base_url)
-    client.events.update(data=data)
+    client.events.update(data=UpdateEventRequest(**data))
 
 
 def _get_events_endpoint(base_url: str) -> str:
