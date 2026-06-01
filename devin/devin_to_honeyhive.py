@@ -50,6 +50,13 @@ DEFAULT_SYNC_INTERVAL = 60
 BATCH_SIZE = 50
 
 
+def _epoch_to_ms(epoch: object) -> int:
+    """Convert an epoch timestamp (seconds or milliseconds) to milliseconds."""
+    if isinstance(epoch, (int, float)) and epoch > 0:
+        return int(epoch) if epoch > 1e12 else int(epoch * 1000)
+    return 0
+
+
 def devin_session_id_to_uuid(devin_session_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"devin-session:{devin_session_id}"))
 
@@ -115,12 +122,8 @@ class DevinClient:
         resp.raise_for_status()
         data = resp.json()
 
-        sessions = []
-        for item in data.get("items", []):
-            sessions.append(self._normalize_v3_session(item))
-
         return {
-            "sessions": sessions,
+            "sessions": [self._normalize_v3_session(item) for item in data.get("items", [])],
             "has_more": data.get("has_next_page", False),
             "cursor": data.get("end_cursor"),
             "total": data.get("total"),
@@ -171,17 +174,11 @@ class DevinClient:
         The returned ``type`` is the raw v3 ``source`` value — always
         ``"user"`` or ``"devin"`` for well-formed responses.
         """
-        created_epoch = item.get("created_at", 0)
-        if isinstance(created_epoch, (int, float)) and created_epoch > 0:
-            timestamp_ms = int(created_epoch * 1000) if created_epoch < 1e12 else int(created_epoch)
-        else:
-            timestamp_ms = 0
-
         return {
             "event_id": item.get("event_id", f"msg-{index}"),
             "type": item.get("source", "unknown"),
             "message": item.get("message", ""),
-            "timestamp_ms": timestamp_ms,
+            "timestamp_ms": _epoch_to_ms(item.get("created_at", 0)),
             "index": index,
         }
 
@@ -225,39 +222,21 @@ class DevinClient:
     @staticmethod
     def _normalize_v3_event(item: dict, index: int) -> dict:
         """Normalize a v3 internal event to a common dict format."""
-        created_epoch = item.get("created_at", 0)
-        if isinstance(created_epoch, (int, float)) and created_epoch > 0:
-            timestamp_ms = int(created_epoch * 1000) if created_epoch < 1e12 else int(created_epoch)
-        else:
-            timestamp_ms = 0
-
         return {
             "event_id": item.get("event_id", f"evt-{index}"),
             "event_type": item.get("event_type", "unknown"),
             "category": item.get("category", "other"),
             "direction": item.get("direction", "outgoing"),
             "summary": item.get("summary", ""),
-            "timestamp_ms": timestamp_ms,
+            "timestamp_ms": _epoch_to_ms(item.get("created_at", 0)),
             "index": index,
         }
 
     def _normalize_v3_session(self, item: dict) -> dict:
         created_epoch = item.get("created_at", 0)
         updated_epoch = item.get("updated_at", 0)
-
-        if isinstance(created_epoch, int) and created_epoch > 1e12:
-            created_ms = created_epoch
-        elif isinstance(created_epoch, int):
-            created_ms = created_epoch * 1000
-        else:
-            created_ms = 0
-
-        if isinstance(updated_epoch, int) and updated_epoch > 1e12:
-            updated_ms = updated_epoch
-        elif isinstance(updated_epoch, int):
-            updated_ms = updated_epoch * 1000
-        else:
-            updated_ms = 0
+        created_ms = _epoch_to_ms(created_epoch)
+        updated_ms = _epoch_to_ms(updated_epoch)
 
         return {
             "devin_session_id": item.get("session_id", ""),
@@ -566,17 +545,8 @@ def map_devin_internal_events_to_hh_events(
 
         hh_event_id = devin_internal_event_id_to_uuid(devin_session_id, evt_id)
 
-        # Determine HoneyHive event_type and name
-        if category in _AGENT_CATEGORIES:
-            hh_type = "model"
-        elif category in _TOOL_CATEGORIES:
-            hh_type = "tool"
-        else:
-            hh_type = "tool"
-
+        hh_type = "model" if category in _AGENT_CATEGORIES else "tool"
         event_name = f"{category}/{evt_type}"
-
-        # Route summary into inputs or outputs based on direction
         if direction == "incoming":
             inputs = {"content": summary}
             outputs = {}
