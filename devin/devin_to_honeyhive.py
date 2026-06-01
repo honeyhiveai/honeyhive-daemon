@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Batch export workflow: Devin sessions → HoneyHive events.
 
-Polls Devin's API for sessions and pushes them to HoneyHive as session events.
-Supports both Devin v1 (apk_* keys) and v3 (cog_* keys) APIs.
+Polls the Devin v3 Organization API for sessions and pushes them to
+HoneyHive as session events, including messages and internal processing
+events.
 
 Usage:
     # One-shot sync
@@ -15,8 +16,8 @@ Usage:
     python devin_to_honeyhive.py --daemon --interval 30
 
 Environment variables:
-    DEVIN_API_KEY       Devin API key (auto-detects v1 vs v3 from prefix)
-    DEVIN_ORG_ID        Required for v3 (cog_*) keys (auto-discovered if admin)
+    DEVIN_API_KEY       Devin service-user API key (cog_* prefix)
+    DEVIN_ORG_ID        Devin organization ID (required)
     HH_API_KEY          HoneyHive API key
     HH_API_URL          HoneyHive data plane URL
     HH_PROJECT          HoneyHive project name (optional; API key is project-scoped)
@@ -66,14 +67,13 @@ class DevinClient:
         self.api_key = api_key
         self.org_id = org_id
         self.headers = {"Authorization": f"Bearer {api_key}"}
-        self.is_v3 = api_key.startswith("cog_")
 
-        if self.is_v3 and not self.org_id:
+        if not self.org_id:
             self.org_id = self._discover_org_id()
             if not self.org_id:
                 raise ValueError(
-                    "DEVIN_ORG_ID is required for v3 (cog_*) API keys and "
-                    "could not be auto-discovered. Set DEVIN_ORG_ID env var."
+                    "DEVIN_ORG_ID is required. Set the DEVIN_ORG_ID env var "
+                    "to your organization ID (find it at Settings → Service Users)."
                 )
             log.info("Auto-discovered org_id: %s", self.org_id)
 
@@ -100,21 +100,11 @@ class DevinClient:
 
     def list_sessions(
         self,
-        updated_after: Optional[int] = None,
-        limit: int = 100,
-        cursor: Optional[str] = None,
-    ) -> dict:
-        if self.is_v3:
-            return self._list_sessions_v3(updated_after, limit, cursor)
-        return self._list_sessions_v1(updated_after, limit)
-
-    def _list_sessions_v3(
-        self,
         updated_after: Optional[int],
         limit: int,
         cursor: Optional[str],
     ) -> dict:
-        url = f"{DEVIN_BASE_URL}/v3beta1/organizations/{self.org_id}/sessions"
+        url = f"{DEVIN_BASE_URL}/v3/organizations/{self.org_id}/sessions"
         params: dict = {"first": min(limit, 200)}
         if updated_after is not None:
             params["updated_after"] = updated_after
@@ -136,72 +126,17 @@ class DevinClient:
             "total": data.get("total"),
         }
 
-    def _list_sessions_v1(
-        self,
-        updated_after: Optional[int],
-        limit: int,
-    ) -> dict:
-        url = f"{DEVIN_BASE_URL}/v1/sessions"
-        params: dict = {"limit": limit}
-
-        resp = requests.get(url, headers=self.headers, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-
-        sessions = []
-        for item in data.get("sessions", []):
-            normalized = self._normalize_v1_session(item)
-            if updated_after and normalized["updated_at_epoch"]:
-                if normalized["updated_at_epoch"] <= updated_after:
-                    continue
-            sessions.append(normalized)
-
-        return {
-            "sessions": sessions,
-            "has_more": False,
-            "cursor": None,
-            "total": len(sessions),
-        }
-
     def get_session(self, session_id: str) -> dict:
-        if self.is_v3:
-            url = f"{DEVIN_BASE_URL}/v3/organizations/{self.org_id}/sessions/devin-{session_id}"
-        else:
-            url = f"{DEVIN_BASE_URL}/v1/sessions/{session_id}"
-
+        url = f"{DEVIN_BASE_URL}/v3/organizations/{self.org_id}/sessions/devin-{session_id}"
         resp = requests.get(url, headers=self.headers, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
-
-        if self.is_v3:
-            return self._normalize_v3_session(data)
-        return self._normalize_v1_session(data)
+        return self._normalize_v3_session(resp.json())
 
     def get_session_details(self, session_id: str) -> dict:
-        if self.is_v3:
-            return self._get_session_details_v3(session_id)
-        return self._get_session_details_v1(session_id)
+        """Fetch session detail and messages.
 
-    def _get_session_details_v1(self, session_id: str) -> dict:
-        url = f"{DEVIN_BASE_URL}/v1/sessions/{session_id}"
-        resp = requests.get(url, headers=self.headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-
-        return {
-            "messages": [
-                self._normalize_v1_message(m, i)
-                for i, m in enumerate(data.get("messages", []))
-            ],
-            "structured_output": data.get("structured_output"),
-        }
-
-    def _get_session_details_v3(self, session_id: str) -> dict:
-        """Fetch session detail and messages via the v3 API.
-
-        The v3 API serves messages on a dedicated paginated endpoint
-        (``/v3/organizations/{org}/sessions/devin-{id}/messages``) rather
-        than embedding them in the session detail response.
+        Messages are served on a dedicated paginated endpoint
+        (``/v3/organizations/{org}/sessions/devin-{id}/messages``).
         """
         # Fetch session-level fields (structured_output, etc.)
         detail_url = (
@@ -254,20 +189,18 @@ class DevinClient:
 
     @staticmethod
     def _normalize_v3_message(item: dict, index: int) -> dict:
-        """Normalize a v3 message to the common format used by the mapper."""
+        """Normalize an API message to the common format used by the mapper."""
         source = item.get("source", "unknown")
         created_epoch = item.get("created_at", 0)
-        # v3 created_at is epoch seconds; convert to ms
         if isinstance(created_epoch, (int, float)) and created_epoch > 0:
             timestamp_ms = int(created_epoch * 1000) if created_epoch < 1e12 else int(created_epoch)
         else:
             timestamp_ms = 0
 
-        # Map v3 source values to the type vocabulary used by v1 / the mapper
         if source == "user":
-            msg_type = "user_message"
+            msg_type = "user"
         elif source == "devin":
-            msg_type = "agent_message"
+            msg_type = "devin"
         else:
             msg_type = source
 
@@ -279,33 +212,12 @@ class DevinClient:
             "index": index,
         }
 
-    @staticmethod
-    def _normalize_v1_message(item: dict, index: int) -> dict:
-        """Normalize a v1 message to the common format used by the mapper."""
-        msg_type = item.get("type", "unknown")
-        timestamp_str = item.get("timestamp", "")
-        timestamp_ms = _iso_to_epoch_ms(timestamp_str)
-
-        return {
-            "event_id": item.get("event_id", f"msg-{index}"),
-            "type": msg_type,
-            "message": item.get("message", ""),
-            "timestamp_ms": timestamp_ms,
-            "origin": item.get("origin"),
-            "user_id": item.get("user_id"),
-            "username": item.get("username"),
-            "index": index,
-        }
-
     def get_session_events(self, session_id: str) -> list:
-        """Fetch internal processing events for a v3 session.
+        """Fetch internal processing events for a session.
 
         Returns a list of normalized event dicts from the
         ``/v3/organizations/{org}/sessions/devin-{id}/events`` endpoint.
-        Only available for v3 API keys.
         """
-        if not self.is_v3:
-            return []
 
         events: list[dict] = []
         cursor: Optional[str] = None
@@ -379,46 +291,19 @@ class DevinClient:
             "devin_session_id": item.get("session_id", ""),
             "title": item.get("title", ""),
             "status": item.get("status", ""),
+            "status_detail": item.get("status_detail", ""),
             "tags": item.get("tags", []),
             "pull_requests": item.get("pull_requests", []),
             "url": item.get("url", ""),
             "user_id": item.get("user_id", ""),
+            "origin": item.get("origin", ""),
+            "category": item.get("category", ""),
+            "playbook_id": item.get("playbook_id"),
             "acus_consumed": item.get("acus_consumed", 0),
             "is_archived": item.get("is_archived", False),
             "parent_session_id": item.get("parent_session_id"),
             "child_session_ids": item.get("child_session_ids", []),
-            "created_at_ms": created_ms,
-            "updated_at_ms": updated_ms,
-            "created_at_epoch": created_epoch,
-            "updated_at_epoch": updated_epoch,
-        }
-
-    def _normalize_v1_session(self, item: dict) -> dict:
-        created_str = item.get("created_at", "")
-        updated_str = item.get("updated_at", "")
-
-        created_ms = _iso_to_epoch_ms(created_str)
-        updated_ms = _iso_to_epoch_ms(updated_str)
-        created_epoch = created_ms // 1000 if created_ms else 0
-        updated_epoch = updated_ms // 1000 if updated_ms else 0
-
-        pr_info = item.get("pull_request", {})
-        pull_requests = []
-        if pr_info and pr_info.get("url"):
-            pull_requests.append({"pr_url": pr_info["url"], "pr_state": ""})
-
-        return {
-            "devin_session_id": item.get("session_id", ""),
-            "title": item.get("title", ""),
-            "status": item.get("status_enum", item.get("status", "")),
-            "tags": item.get("tags", []),
-            "pull_requests": pull_requests,
-            "url": f"https://app.devin.ai/sessions/{item.get('session_id', '')}",
-            "user_id": item.get("requesting_user_email", ""),
-            "acus_consumed": 0,
-            "is_archived": False,
-            "parent_session_id": None,
-            "child_session_ids": [],
+            "structured_output": item.get("structured_output"),
             "created_at_ms": created_ms,
             "updated_at_ms": updated_ms,
             "created_at_epoch": created_epoch,
@@ -525,17 +410,7 @@ class SyncState:
         return self._state.get("synced_sessions", {}).get(devin_session_id, {}).get("synced_event_count", 0)
 
 
-def _iso_to_epoch_ms(iso_str: str) -> int:
-    if not iso_str:
-        return 0
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        return int(dt.timestamp() * 1000)
-    except (ValueError, TypeError):
-        return 0
-
-
-def map_devin_to_hh_session(session: dict, project: str = "") -> dict:
+def map_devin_to_hh_session(session: dict, project: str) -> dict:
     hh_session_id = devin_session_id_to_uuid(session["devin_session_id"])
 
     pr_urls = [pr.get("pr_url", "") for pr in session.get("pull_requests", []) if pr.get("pr_url")]
@@ -555,15 +430,22 @@ def map_devin_to_hh_session(session: dict, project: str = "") -> dict:
         },
         "metadata": {
             "devin_status": session.get("status", ""),
+            "devin_status_detail": session.get("status_detail", ""),
             "devin_tags": session.get("tags", []),
             "devin_url": session.get("url", ""),
             "devin_pull_requests": pr_urls,
+            "devin_origin": session.get("origin", ""),
+            "devin_category": session.get("category", ""),
+            "devin_playbook_id": session.get("playbook_id"),
             "devin_is_archived": session.get("is_archived", False),
             "devin_parent_session_id": session.get("parent_session_id"),
             "devin_child_session_ids": session.get("child_session_ids", []),
         },
         "metrics": {
             "acus_consumed": session.get("acus_consumed", 0),
+        },
+        "inputs": {
+            "prompt": session.get("title", ""),
         },
         "start_time": session.get("created_at_ms", 0),
         "end_time": session.get("updated_at_ms", 0),
@@ -602,7 +484,7 @@ def map_devin_messages_to_hh_events(
     """Map normalized Devin messages to HoneyHive child events.
 
     Messages are expected to already be in the normalized format produced by
-    ``DevinClient._normalize_v3_message`` / ``_normalize_v1_message``.
+    ``DevinClient._normalize_v3_message``.
     """
     events = []
     for i, msg in enumerate(messages):
@@ -826,9 +708,13 @@ def map_devin_to_hh_update(session: dict) -> dict:
     return {
         "metadata": {
             "devin_status": session.get("status", ""),
+            "devin_status_detail": session.get("status_detail", ""),
             "devin_tags": session.get("tags", []),
             "devin_url": session.get("url", ""),
             "devin_pull_requests": pr_urls,
+            "devin_origin": session.get("origin", ""),
+            "devin_category": session.get("category", ""),
+            "devin_playbook_id": session.get("playbook_id"),
             "devin_is_archived": session.get("is_archived", False),
             "devin_parent_session_id": session.get("parent_session_id"),
             "devin_child_session_ids": session.get("child_session_ids", []),
@@ -1047,8 +933,7 @@ def _sync_session_internal_events(
     hh_parent_event_id: str,
 ) -> int:
     """Fetch and sync Devin internal processing events for a session."""
-    if not devin.is_v3:
-        return 0
+
 
     try:
         raw_events = devin.get_session_events(devin_sid)
@@ -1178,7 +1063,7 @@ def main() -> None:
     hh = HoneyHiveClient(api_key=hh_api_key, api_url=hh_api_url, project=hh_project)
     state = SyncState(args.state_file)
 
-    log.info("Devin API: %s mode", "v3" if devin.is_v3 else "v1")
+    log.info("Devin API: v3 (org=%s)", devin.org_id)
     if hh.project:
         log.info("HoneyHive: %s → project '%s'", hh.api_url, hh.project)
     else:
