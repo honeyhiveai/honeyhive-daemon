@@ -32,7 +32,7 @@ def export_event(config: DaemonConfig, event: Dict[str, Any]) -> None:
         f"api_key_fingerprint={_key_fingerprint(config.api_key)}"
     )
     client = HoneyHive(api_key=config.api_key, base_url=config.base_url)
-    client.events.create_event(PostEventRequest(event=payload["event"]))
+    client.events.create_event(PostEventRequest(**payload["event"]))
     log_message(
         "exported claude event "
         f"event_name={event['event_name']} "
