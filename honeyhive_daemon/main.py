@@ -15,6 +15,7 @@ from typing import Optional
 import click
 
 from .claude_hooks import (
+    _is_daemon_hook_command,
     get_hook_command,
     install_claude_hooks,
     normalize_claude_payload,
@@ -963,7 +964,6 @@ def _settings_have_command(settings_path: Path) -> bool:
     except json.JSONDecodeError:
         return False
     hooks = settings.get("hooks", {})
-    target = get_hook_command()
     for entries in hooks.values():
         if not isinstance(entries, list):
             continue
@@ -971,7 +971,9 @@ def _settings_have_command(settings_path: Path) -> bool:
             if not isinstance(entry, dict):
                 continue
             for hook in entry.get("hooks", []):
-                if hook.get("type") == "command" and hook.get("command") == target:
+                if hook.get("type") == "command" and _is_daemon_hook_command(
+                    str(hook.get("command", ""))
+                ):
                     return True
     return False
 
