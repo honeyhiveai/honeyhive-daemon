@@ -8,7 +8,12 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from honeyhive_daemon.ci import _extract_error
-from honeyhive_daemon.claude_hooks import install_claude_hooks, normalize_claude_payload
+from honeyhive_daemon.claude_hooks import (
+    _is_daemon_hook_command,
+    get_hook_command,
+    install_claude_hooks,
+    normalize_claude_payload,
+)
 from honeyhive_daemon.config import DaemonConfig
 from honeyhive_daemon.exporter import export_event
 from honeyhive_daemon.git_hooks import HOOK_MARKER_START, install_post_commit_hook
@@ -18,6 +23,79 @@ from honeyhive_daemon.state import (
     mark_session_artifact_pushed,
     record_session_activity,
 )
+
+
+def test_get_hook_command_uses_resolved_binary(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "honeyhive_daemon.claude_hooks.shutil.which",
+        lambda _: "/opt/venv/bin/honeyhive-daemon",
+    )
+    assert (
+        get_hook_command()
+        == "/opt/venv/bin/honeyhive-daemon ingest claude-hook"
+    )
+
+
+def test_get_hook_command_quotes_paths_with_spaces(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "honeyhive_daemon.claude_hooks.shutil.which",
+        lambda _: "/opt/my venv/bin/honeyhive-daemon",
+    )
+    assert (
+        get_hook_command()
+        == "'/opt/my venv/bin/honeyhive-daemon' ingest claude-hook"
+    )
+
+
+def test_is_daemon_hook_command_recognizes_exe_and_rejects_wrappers() -> None:
+    assert _is_daemon_hook_command(
+        "C:/Tools/honeyhive-daemon.exe ingest claude-hook"
+    )
+    assert _is_daemon_hook_command(
+        "/opt/venv/bin/honeyhive-daemon ingest claude-hook"
+    )
+    assert not _is_daemon_hook_command(
+        "echo warmup && /opt/venv/bin/honeyhive-daemon ingest claude-hook"
+    )
+
+
+def test_install_claude_hooks_replaces_legacy_bare_command(tmp_path: Path) -> None:
+    """Re-install removes bare-path hooks and leaves a single absolute hook."""
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "honeyhive-daemon ingest claude-hook",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    install_claude_hooks(
+        settings_path, "/opt/venv/bin/honeyhive-daemon ingest claude-hook"
+    )
+
+    data = json.loads(settings_path.read_text(encoding="utf-8"))
+    commands = [
+        hook["command"]
+        for entry in data["hooks"]["SessionStart"]
+        for hook in entry["hooks"]
+        if hook.get("type") == "command"
+    ]
+    assert commands == ["/opt/venv/bin/honeyhive-daemon ingest claude-hook"]
 
 
 def test_install_claude_hooks_idempotent(tmp_path: Path) -> None:

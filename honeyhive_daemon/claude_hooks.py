@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,9 +21,55 @@ from .mappings import (
 )
 
 
+_DAEMON_HOOK_ARGS = ("ingest", "claude-hook")
+_DAEMON_EXECUTABLE_NAMES = frozenset({"honeyhive-daemon", "honeyhive-daemon.exe"})
+
+
+def _split_hook_command(command: str) -> tuple[str, list[str]]:
+    """Split a hook command string into executable and args."""
+    text = command.strip()
+    if not text:
+        return "", []
+    for posix in (os.name != "nt", False):
+        try:
+            parts = shlex.split(text, posix=posix)
+        except ValueError:
+            continue
+        if parts:
+            return parts[0], parts[1:]
+    return "", []
+
+
+def _is_daemon_hook_command(command: str) -> bool:
+    """True if *command* invokes this repo's Claude ingest hook."""
+    executable, args = _split_hook_command(command)
+    if Path(executable).name not in _DAEMON_EXECUTABLE_NAMES:
+        return False
+    return tuple(args) == _DAEMON_HOOK_ARGS
+
+
+def _format_hook_command(daemon_bin: str) -> str:
+    """Build a shell-safe hook command for the resolved daemon binary."""
+    argv = [daemon_bin, *_DAEMON_HOOK_ARGS]
+    if os.name == "nt":
+        return subprocess.list2cmdline(argv)
+    return shlex.join(argv)
+
+
 def get_hook_command() -> str:
-    """Return the command registered in Claude settings."""
-    return "honeyhive-daemon ingest claude-hook"
+    """Return the command registered in Claude settings.
+
+    Uses an absolute path to the ``honeyhive-daemon`` binary that is running
+    ``run``, so Claude Code hooks do not pick up a different install on PATH
+    (e.g. a pyenv shim without the ``honeyhive`` dependency).
+    """
+    resolved = shutil.which("honeyhive-daemon")
+    if not resolved and sys.argv:
+        candidate = Path(sys.argv[0]).resolve()
+        if candidate.name in _DAEMON_EXECUTABLE_NAMES:
+            resolved = str(candidate)
+    daemon_bin = resolved or "honeyhive-daemon"
+    return _format_hook_command(daemon_bin)
 
 
 def install_claude_hooks(settings_path: Path, command: str) -> bool:
@@ -65,7 +116,8 @@ def _sync_hook_entries(
             hook
             for hook in entry.get("hooks", [])
             if not (
-                hook.get("type") == "command" and hook.get("command") == command
+                hook.get("type") == "command"
+                and _is_daemon_hook_command(str(hook.get("command", "")))
             )
         ]
         if not remaining_hooks:
