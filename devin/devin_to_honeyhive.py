@@ -132,42 +132,22 @@ class DevinClient:
         resp.raise_for_status()
         return self._normalize_v3_session(resp.json())
 
-    def get_session_details(self, session_id: str) -> dict:
-        """Fetch session detail and messages.
-
-        Messages are served on a dedicated paginated endpoint
-        (``/v3/organizations/{org}/sessions/devin-{id}/messages``).
-        """
-        # Fetch session-level fields (structured_output, etc.)
-        detail_url = (
-            f"{DEVIN_BASE_URL}/v3/organizations/{self.org_id}"
-            f"/sessions/devin-{session_id}"
-        )
-        structured_output = None
-        try:
-            detail_resp = requests.get(
-                detail_url, headers=self.headers, timeout=30,
-            )
-            if detail_resp.ok:
-                structured_output = detail_resp.json().get("structured_output")
-        except requests.RequestException:
-            pass
-
-        # Paginate through the messages endpoint
+    def get_session_messages(self, session_id: str) -> list[dict]:
+        """Paginate through the messages endpoint and return normalized dicts."""
         messages: list[dict] = []
         cursor: Optional[str] = None
         msg_index = 0
+        base_url = (
+            f"{DEVIN_BASE_URL}/v3/organizations/{self.org_id}"
+            f"/sessions/devin-{session_id}/messages"
+        )
         while True:
-            msgs_url = (
-                f"{DEVIN_BASE_URL}/v3/organizations/{self.org_id}"
-                f"/sessions/devin-{session_id}/messages"
-            )
             params: dict = {"first": 200}
             if cursor:
                 params["after"] = cursor
 
             resp = requests.get(
-                msgs_url, headers=self.headers, params=params, timeout=30,
+                base_url, headers=self.headers, params=params, timeout=30,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -182,31 +162,24 @@ class DevinClient:
             if not cursor:
                 break
 
-        return {
-            "messages": messages,
-            "structured_output": structured_output,
-        }
+        return messages
 
     @staticmethod
     def _normalize_v3_message(item: dict, index: int) -> dict:
-        """Normalize an API message to the common format used by the mapper."""
-        source = item.get("source", "unknown")
+        """Normalize an API message to the common format used by the mapper.
+
+        The returned ``type`` is the raw v3 ``source`` value — always
+        ``"user"`` or ``"devin"`` for well-formed responses.
+        """
         created_epoch = item.get("created_at", 0)
         if isinstance(created_epoch, (int, float)) and created_epoch > 0:
             timestamp_ms = int(created_epoch * 1000) if created_epoch < 1e12 else int(created_epoch)
         else:
             timestamp_ms = 0
 
-        if source == "user":
-            msg_type = "user"
-        elif source == "devin":
-            msg_type = "devin"
-        else:
-            msg_type = source
-
         return {
             "event_id": item.get("event_id", f"msg-{index}"),
-            "type": msg_type,
+            "type": item.get("source", "unknown"),
             "message": item.get("message", ""),
             "timestamp_ms": timestamp_ms,
             "index": index,
@@ -218,7 +191,6 @@ class DevinClient:
         Returns a list of normalized event dicts from the
         ``/v3/organizations/{org}/sessions/devin-{id}/events`` endpoint.
         """
-
         events: list[dict] = []
         cursor: Optional[str] = None
         index = 0
@@ -410,6 +382,24 @@ class SyncState:
         return self._state.get("synced_sessions", {}).get(devin_session_id, {}).get("synced_event_count", 0)
 
 
+def _build_session_metadata(session: dict) -> dict:
+    """Build the ``metadata`` dict shared by create and update payloads."""
+    pr_urls = [pr.get("pr_url", "") for pr in session.get("pull_requests", []) if pr.get("pr_url")]
+    return {
+        "devin_status": session.get("status", ""),
+        "devin_status_detail": session.get("status_detail", ""),
+        "devin_tags": session.get("tags", []),
+        "devin_url": session.get("url", ""),
+        "devin_pull_requests": pr_urls,
+        "devin_origin": session.get("origin", ""),
+        "devin_category": session.get("category", ""),
+        "devin_playbook_id": session.get("playbook_id"),
+        "devin_is_archived": session.get("is_archived", False),
+        "devin_parent_session_id": session.get("parent_session_id"),
+        "devin_child_session_ids": session.get("child_session_ids", []),
+    }
+
+
 def map_devin_to_hh_session(session: dict, project: str) -> dict:
     hh_session_id = devin_session_id_to_uuid(session["devin_session_id"])
 
@@ -423,29 +413,17 @@ def map_devin_to_hh_session(session: dict, project: str) -> dict:
         "session_id": hh_session_id,
         "session_name": session.get("title") or f"Devin Session {session['devin_session_id'][:8]}",
         "source": "devin-export",
-        "inputs": {"query": initial_query} if initial_query else {},
         "user_properties": {
             "devin_user_id": session.get("user_id", ""),
             "devin_session_id": session["devin_session_id"],
         },
-        "metadata": {
-            "devin_status": session.get("status", ""),
-            "devin_status_detail": session.get("status_detail", ""),
-            "devin_tags": session.get("tags", []),
-            "devin_url": session.get("url", ""),
-            "devin_pull_requests": pr_urls,
-            "devin_origin": session.get("origin", ""),
-            "devin_category": session.get("category", ""),
-            "devin_playbook_id": session.get("playbook_id"),
-            "devin_is_archived": session.get("is_archived", False),
-            "devin_parent_session_id": session.get("parent_session_id"),
-            "devin_child_session_ids": session.get("child_session_ids", []),
-        },
+        "metadata": _build_session_metadata(session),
         "metrics": {
             "acus_consumed": session.get("acus_consumed", 0),
         },
         "inputs": {
             "prompt": session.get("title", ""),
+            **({"query": initial_query} if initial_query else {}),
         },
         "start_time": session.get("created_at_ms", 0),
         "end_time": session.get("updated_at_ms", 0),
@@ -463,9 +441,9 @@ def build_chat_history(messages: list) -> list:
     for msg in messages:
         msg_type = msg.get("type", "unknown")
         content = msg.get("message", "")
-        if msg_type in ("user_message", "user", "initial_user_message"):
+        if msg_type == "user":
             role = "user"
-        elif msg_type in ("agent_message", "devin", "devin_message"):
+        elif msg_type == "devin":
             role = "assistant"
         else:
             role = msg_type
@@ -484,7 +462,8 @@ def map_devin_messages_to_hh_events(
     """Map normalized Devin messages to HoneyHive child events.
 
     Messages are expected to already be in the normalized format produced by
-    ``DevinClient._normalize_v3_message``.
+    ``DevinClient._normalize_v3_message`` — ``type`` is ``"user"`` or
+    ``"devin"``.
     """
     events = []
     for i, msg in enumerate(messages):
@@ -496,19 +475,13 @@ def map_devin_messages_to_hh_events(
         msg_type = msg.get("type", "unknown")
         msg_content = msg.get("message", "")
         msg_timestamp_ms = msg.get("timestamp_ms", 0)
-        msg_origin = msg.get("origin")
-        msg_user_id = msg.get("user_id")
-        msg_username = msg.get("username")
 
-        is_user_message = msg_type in ("user_message", "user", "initial_user_message")
-        is_agent_message = msg_type in ("agent_message", "devin", "devin_message")
-
-        if is_user_message:
+        if msg_type == "user":
             event_type = "chain"
             event_name = msg_type
             inputs = {"message": msg_content}
             outputs = {}
-        elif is_agent_message:
+        elif msg_type == "devin":
             event_type = "model"
             event_name = msg_type
             inputs = {}
@@ -519,7 +492,7 @@ def map_devin_messages_to_hh_events(
             inputs = {}
             outputs = {"message": msg_content}
 
-        event = {
+        events.append({
             **({"project": project} if project else {}),
             "event_id": hh_event_id,
             "session_id": hh_session_id,
@@ -537,15 +510,7 @@ def map_devin_messages_to_hh_events(
                 "devin_session_id": devin_session_id,
                 "message_index": msg.get("index", i),
             },
-        }
-        if msg_origin:
-            event["metadata"]["origin"] = msg_origin
-        if msg_user_id:
-            event["metadata"]["user_id"] = msg_user_id
-        if msg_username:
-            event["metadata"]["username"] = msg_username
-
-        events.append(event)
+        })
 
     return events
 
@@ -667,13 +632,11 @@ def map_devin_session_end(
     artifact_content = []
     for msg in messages:
         msg_type = msg.get("type", "unknown")
-        is_user = msg_type in ("user_message", "user", "initial_user_message")
+        is_user = msg_type == "user"
         artifact_content.append({
-            "type": "tool_use" if not is_user else "text",
-            "tool_name": msg_type if not is_user else None,
+            "type": "text" if is_user else "tool_use",
+            "tool_name": None if is_user else msg_type,
             "message": msg.get("message", ""),
-            "timestamp": msg.get("timestamp", ""),
-            "origin": msg.get("origin"),
         })
     return {
         **({"project": project} if project else {}),
@@ -703,22 +666,8 @@ def map_devin_session_end(
 
 
 def map_devin_to_hh_update(session: dict) -> dict:
-    pr_urls = [pr.get("pr_url", "") for pr in session.get("pull_requests", []) if pr.get("pr_url")]
-
     return {
-        "metadata": {
-            "devin_status": session.get("status", ""),
-            "devin_status_detail": session.get("status_detail", ""),
-            "devin_tags": session.get("tags", []),
-            "devin_url": session.get("url", ""),
-            "devin_pull_requests": pr_urls,
-            "devin_origin": session.get("origin", ""),
-            "devin_category": session.get("category", ""),
-            "devin_playbook_id": session.get("playbook_id"),
-            "devin_is_archived": session.get("is_archived", False),
-            "devin_parent_session_id": session.get("parent_session_id"),
-            "devin_child_session_ids": session.get("child_session_ids", []),
-        },
+        "metadata": _build_session_metadata(session),
         "metrics": {
             "acus_consumed": session.get("acus_consumed", 0),
         },
@@ -828,19 +777,18 @@ def _sync_session_messages(
     session: Optional[dict] = None,
 ) -> int:
     try:
-        details = devin.get_session_details(devin_sid)
+        messages = devin.get_session_messages(devin_sid)
     except requests.RequestException as e:
-        log.warning("Failed to fetch details for session %s: %s", devin_sid[:12], e)
+        log.warning("Failed to fetch messages for session %s: %s", devin_sid[:12], e)
         return state.get_synced_message_count(devin_sid)
 
-    messages = details.get("messages", [])
     if not messages:
         return 0
 
     # ── Update chat_history + structured_output + inputs on the parent session ──
     chat_history = build_chat_history(messages)
     session_outputs: dict = {"chat_history": chat_history}
-    structured_output = details.get("structured_output")
+    structured_output = session.get("structured_output") if session else None
     if structured_output is not None:
         session_outputs["structured_output"] = structured_output
 
@@ -933,8 +881,6 @@ def _sync_session_internal_events(
     hh_parent_event_id: str,
 ) -> int:
     """Fetch and sync Devin internal processing events for a session."""
-
-
     try:
         raw_events = devin.get_session_events(devin_sid)
     except requests.RequestException as e:
