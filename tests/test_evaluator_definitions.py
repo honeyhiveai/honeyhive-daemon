@@ -103,3 +103,30 @@ def test_python_evaluators_read_nested_claude_tool_use_blocks() -> None:
     assert _run_python_evaluator("Coding Agent - Bash Ratio", event) == 0.5
     assert _run_python_evaluator("Coding Agent - Tool to Model Ratio", event) == 2.0
 
+
+def test_bash_edit_misuse_reads_nested_claude_tool_inputs() -> None:
+    event = {
+        "outputs": {
+            "artifact": {
+                "content": [
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "id": "toolu_1",
+                                    "input": {"command": "sed -i '' 's/a/b/' file.py"},
+                                }
+                            ],
+                        },
+                    }
+                ]
+            }
+        }
+    }
+
+    assert _run_python_evaluator("Coding Agent - Bash Edit Misuse", event) == 1.0
+

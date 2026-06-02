@@ -30,11 +30,10 @@ def log_message(message: str) -> None:
 def _locked_text_file(path):
     """Open a state text file under an exclusive lock."""
     ensure_state_layout()
-    if not path.exists():
-        path.write_text("", encoding="utf-8")
-    with path.open("r+", encoding="utf-8") as handle:
+    with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
+            handle.seek(0)
             yield handle
             handle.flush()
         finally:
@@ -45,11 +44,10 @@ def _locked_text_file(path):
 def _locked_json_mapping(path, malformed_message: str) -> Iterator[Dict[str, Any]]:
     """Load and save a JSON object state file under an exclusive lock."""
     ensure_state_layout()
-    if not path.exists():
-        path.write_text("{}\n", encoding="utf-8")
-    with path.open("r+", encoding="utf-8") as handle:
+    with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
+            handle.seek(0)
             raw = handle.read()
             try:
                 data = json.loads(raw) if raw.strip() else {}
@@ -248,15 +246,6 @@ def claim_skills_listed_export(session_id: str) -> bool:
             return False
         session["skills_listed_exported"] = True
         return True
-
-
-def release_skills_listed_export(session_id: str) -> None:
-    """Release a skills-listing export claim after a failed export attempt."""
-    with _locked_session_index() as index:
-        session = index.get(session_id)
-        if session is None:
-            return
-        session["skills_listed_exported"] = False
 
 
 def claim_tool_usage_request_id(session_id: str, request_id: str) -> bool:

@@ -55,16 +55,22 @@ def extract_events_from_artifact(event):
         return []
     return content
 
-def tool_names_from_record(record):
-    \"\"\"Return one tool name per tool invocation in raw or normalized records.\"\"\"
+def tool_calls_from_record(record):
+    \"\"\"Return one call per tool invocation in raw or normalized records.\"\"\"
     ename = record.get("event_name", "")
     if ename.startswith("tool."):
-        return [ename[5:]]
+        return [{
+            "name": ename[5:],
+            "input": record.get("tool_input") or record.get("input") or {},
+        }]
 
     etype = record.get("type", "")
     tool_name = record.get("tool_name") or record.get("toolName") or record.get("name")
     if etype in ("tool_use", "tool_result") and tool_name:
-        return [str(tool_name)]
+        return [{
+            "name": str(tool_name),
+            "input": record.get("tool_input") or record.get("input") or {},
+        }]
 
     message = record.get("message")
     if not isinstance(message, dict):
@@ -73,11 +79,18 @@ def tool_names_from_record(record):
     if not isinstance(content, list):
         return []
 
-    names = []
+    calls = []
     for block in content:
         if isinstance(block, dict) and block.get("type") == "tool_use":
-            names.append(str(block.get("name") or "other"))
-    return names
+            calls.append({
+                "name": str(block.get("name") or "other"),
+                "input": block.get("input") or {},
+            })
+    return calls
+
+def tool_names_from_record(record):
+    \"\"\"Return one tool name per tool invocation in raw or normalized records.\"\"\"
+    return [call["name"] for call in tool_calls_from_record(record)]
 
 def record_is_tool(record):
     \"\"\"True when the record represents at least one tool event.\"\"\"
@@ -144,14 +157,17 @@ def evaluate(event):
     for r in records:
         if not isinstance(r, dict):
             continue
-        categories = [normalize_tool("tool." + name) for name in tool_names_from_record(r)]
+        calls = tool_calls_from_record(r)
+        categories = [normalize_tool("tool." + call["name"]) for call in calls]
         if not categories and record_is_tool(r):
             categories = [normalize_tool(r.get("event_name", ""))]
         if "file_edit" in categories:
             edit_tool_count += 1
-        if "bash" in categories:
+        for call, category in zip(calls, categories):
+            if category != "bash":
+                continue
             cmd = ""
-            tool_input = r.get("tool_input") or r.get("input") or {}
+            tool_input = call.get("input") or {}
             if isinstance(tool_input, dict):
                 cmd = str(tool_input.get("command", ""))
             elif isinstance(tool_input, str):
