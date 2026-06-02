@@ -9,6 +9,15 @@ description: Run a real Claude Code session through honeyhive-daemon, verify Hon
 
 Agent-only. No wrapper scripts. Daemon in **detached tmux**; Claude via **`claude -p`**.
 
+## Devin Secrets Needed
+
+| Secret | Purpose |
+|--------|---------|
+| `CODING_AGENT_HH_API_KEY` | Production DP1 export key |
+| `ANTHROPIC_API_KEY` | Claude Code CLI auth |
+
+The API URL for production DP1 is `https://api.dp1.us.prod.honeyhive.ai`.
+
 ## Prerequisites
 
 - Claude Code CLI (`claude`) authenticated
@@ -34,6 +43,8 @@ file "$(which honeyhive-daemon)" "$(which honeyhive)"
 - **`SessionEnd hook ... Hook cancelled` on stderr** — common in print mode; wait `sleep 12` and trust `daemon.log` + API, not stderr alone.
 - **Artifact flush is async** — daemon loop ~5s; wait 12s before declaring failure.
 - **Re-run `run` in tmux after upgrading** — refreshes absolute hook path in `~/.claude/settings.json`.
+- **CLI stderr corrupts JSON** — when piping `honeyhive events search` to a file, use `2>/dev/null` to prevent the `HH_API_URL` deprecation warning from mixing into JSON output.
+- **Spool reason race** — daemon background flush loop may modify spool entries between `status` calls. Capture `status` output in a single invocation.
 
 ## Workflow
 
@@ -67,7 +78,7 @@ honeyhive-daemon status
 honeyhive-daemon doctor
 ```
 
-Optional: `HH_DAEMON_HOME` in the tmux block for isolated state.
+Optional: `HH_DAEMON_HOME` in the tmux block for isolated state. This is recommended for testing — it prevents stale state from prior runs from interfering.
 
 Cleanup: `honeyhive-daemon stop` or `tmux kill-session -t honeyhive`.
 
@@ -103,7 +114,7 @@ honeyhive-daemon status
 grep "$SESSION" "$LOG" | grep -E 'exported|artifact|session\.end|spooled|fail'
 ```
 
-Expect: `exported claude event`; `updated session artifact` with `session_end`; no `spooled claude event` for `$SESSION`.
+Expect: `exported claude event`; `session ended session_id=...`; `updated session artifact` with `session_end`; no `spooled claude event` for `$SESSION`.
 
 ### 7. Fetch events (HoneyHive CLI)
 
@@ -114,14 +125,15 @@ honeyhive events search \
   --data-plane-url "$HH_API_URL" \
   --filters "[{\"field\":\"session_id\",\"value\":\"$SESSION\",\"operator\":\"is\",\"type\":\"string\"}]" \
   --limit 50 \
-  > session_export.json
+  2>/dev/null > session_export.json
 
 python3 -c "
 import json
 d=json.load(open('session_export.json'))
-for e in sorted(d.get('events',[]), key=lambda x: x.get('start_time',0)):
-    print(e.get('event_name'), e.get('event_type'))
-print('count:', len(d.get('events',[])))
+events = sorted(d.get('events',[]), key=lambda x: x.get('start_time',0))
+for e in events:
+    print(e.get('event_name'), e.get('event_type'), f'duration={e.get(\"duration\")}')
+print('count:', len(events))
 "
 ```
 
@@ -137,13 +149,13 @@ For each checklist miss or log/API anomaly:
 
 **Known gaps to watch for** (from prior runs; fix when reproduced):
 
-| Gap | Where to look |
-|-----|----------------|
-| `session.end` missing after `claude -p` | Hook timeout, daemon not running, stderr “Hook cancelled” + no artifact after 12s |
-| Spool never drains | `grep -E 'spool|validation|error' "$LOG"`; SDK version vs `pyproject.toml` |
-| Artifact 400 retries | Stale `state/sessions.json`; cap retries in daemon |
-| `total_tokens` / cost 0 in UI | `metadata.prompt_tokens` on turns — daemon vs backend |
-| `coding_agent.model_count` 0 | `_compute_session_metrics` / transcript parser |
+| Gap | Where to look | Status |
+|-----|---------------|--------|
+| `session.end` missing after `claude -p` | Hook timeout, daemon not running | Fixed in HHAI-5521 (synthetic session.end) |
+| Spool never drains | `grep -E 'spool|validation|error' "$LOG"` | Fixed in HHAI-5521 (retry cap) |
+| Artifact 400 retries | Stale `state/sessions.json`; cap retries in daemon | Fixed in HHAI-5521 (ARTIFACT_MAX_RETRIES=3) |
+| `total_tokens` / cost 0 in UI | `metadata.prompt_tokens` on turns | Pre-existing: Claude transcript lacks `usage` data |
+| `coding_agent.model_count` 0 | `_compute_session_metrics` / transcript parser | Fixed in HHAI-5521 (count "assistant" records) |
 
 Record fixes: commit on a branch, or short note in the task (issue id + session uuid).
 
@@ -152,6 +164,10 @@ Record fixes: commit on a branch, or short note in the task (issue id + session 
 - [ ] Spool empty (`status` + `spool/events.jsonl`)
 - [ ] `session.start`, `turn.user`, `turn.agent` (and `tool.*` if testing tools)
 - [ ] `session.end` in CLI export
+- [ ] "session ended session_id=..." log line in daemon.log
+- [ ] `coding_agent.model_count` ≥ 1 on session.start metrics
+- [ ] `chat_history` on turn events has ≥ 1 entry (not empty `[]`)
+- [ ] All events have `duration` > 0
 - [ ] Transcript: `session.end` → `outputs.artifact` and/or `session.start` → `chat_history`
 
 If anything fails, **do not stop at FAIL** — follow §8 and land a fix or a filed issue with reproduction.
@@ -169,3 +185,5 @@ If anything fails, **do not stop at FAIL** — follow §8 and land a fix or a fi
 | CLI stderr: `HH_API_URL` deprecated | Env name legacy; flag is correct | Non-zero exit only is failure; search can still succeed |
 | Wrong events in export | Used fallback session id on busy log | Prefer primary `session_end` artifact line; verify `SESSION` matches this run’s log lines |
 | UI 0 total tokens | Missing rollup fields | Inspect event metadata; fix daemon or document backend gap |
+| JSON parse error on CLI output | stderr deprecation warning mixed into redirected stdout | Use `2>/dev/null` when redirecting CLI output to file |
+| Spool reason changes between status calls | Daemon flush loop modifies spool in background | Capture status in single call; race is in test harness, not code |
