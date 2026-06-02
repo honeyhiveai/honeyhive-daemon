@@ -150,3 +150,38 @@ class TestInitCommand:
             lines = content.splitlines()
             assert "node_modules/" in lines
             assert ".honeyhive/config.local.json" in lines
+
+    def test_init_url_persists_base_url(self, tmp_path: Path) -> None:
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path) as td:
+            result = runner.invoke(
+                cli,
+                [
+                    "init",
+                    "--project",
+                    "my-proj",
+                    "--url",
+                    "https://custom.api.honeyhive.ai",
+                ],
+            )
+            assert result.exit_code == 0, result.output
+
+            local_config = json.loads(
+                (Path(td) / ".honeyhive" / "config.local.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert local_config["base_url"] == "https://custom.api.honeyhive.ai"
+
+    def test_init_without_url_omits_base_url(self, tmp_path: Path) -> None:
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path) as td:
+            result = runner.invoke(cli, ["init", "--project", "my-proj"])
+            assert result.exit_code == 0, result.output
+
+            local_config = json.loads(
+                (Path(td) / ".honeyhive" / "config.local.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert "base_url" not in local_config

@@ -20,7 +20,10 @@ from honeyhive_daemon.exporter import export_event
 from honeyhive_daemon.git_hooks import HOOK_MARKER_START, install_post_commit_hook
 from honeyhive_daemon.main import _push_pending_session_artifacts, cli
 from honeyhive_daemon.state import (
+    append_chat_history,
+    append_spool_event,
     get_sessions_needing_artifact,
+    load_session_index,
     mark_session_artifact_pushed,
     record_session_activity,
 )
@@ -446,6 +449,95 @@ def test_cli_status_without_config(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert "Configured: no" in result.output
+    assert "Pending spool events: 0" in result.output
+
+
+def test_cli_status_shows_configured_project(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from honeyhive_daemon.config import save_config
+
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    save_config(
+        DaemonConfig(
+            api_key="hh_test",
+            base_url="https://api.honeyhive.ai",
+            project="my-folder-name",
+        )
+    )
+
+    result = CliRunner().invoke(cli, ["status"])
+    assert result.exit_code == 0
+    assert "my-folder-name" in result.output
+
+
+def test_cli_status_shows_spool_failure_reason(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    append_spool_event(
+        {
+            "event_name": "session.start",
+            "spool_reason": "Connection refused: https://api.honeyhive.ai/events",
+        }
+    )
+
+    result = CliRunner().invoke(cli, ["status"])
+    assert result.exit_code == 0
+    assert "Connection refused" in result.output
+
+
+def test_append_chat_history_includes_current_message(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+
+    first = append_chat_history("sess-chat", "user", "first")
+    second = append_chat_history("sess-chat", "assistant", "reply")
+    third = append_chat_history("sess-chat", "user", "second")
+
+    assert first[-1] == {"role": "user", "content": "first"}
+    assert len(second) == 2
+    assert third[-1] == {"role": "user", "content": "second"}
+    assert len(third) == 3
+
+
+def test_ingest_session_end_logs_session_id(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from honeyhive_daemon.config import save_config
+
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    log_messages: list[str] = []
+    monkeypatch.setattr(
+        "honeyhive_daemon.main.log_message",
+        lambda message: log_messages.append(message),
+    )
+    monkeypatch.setattr("honeyhive_daemon.main.export_event", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        "honeyhive_daemon.main.resolve_config",
+        lambda **kw: kw.get("cli_defaults"),
+    )
+    save_config(
+        DaemonConfig(
+            api_key="hh_test",
+            base_url="https://api.honeyhive.ai",
+            project="demo",
+        )
+    )
+
+    payload = json.dumps(
+        {
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-log-test",
+            "event": {"event_id": "evt-log-test"},
+        }
+    )
+    result = CliRunner().invoke(cli, ["ingest", "claude-hook"], input=payload)
+    assert result.exit_code == 0, result.output
+    assert any(
+        "session ended" in msg and "sess-log-test" in msg for msg in log_messages
+    )
 
 
 def _nested_event_dict(request) -> dict:  # type: ignore[no-untyped-def]
@@ -684,6 +776,138 @@ def test_push_pending_session_artifacts_updates_root_event(
     assert len(metrics_captured) == 1
     assert metrics_captured[0]["event_id"] == "sess-root-1"
     assert "coding_agent.total_events" in metrics_captured[0]["metrics"]
+
+
+def test_push_pending_session_artifacts_retries_when_synthetic_session_end_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        '{"type":"user","message":{"role":"user","content":"hi"}}\n',
+        encoding="utf-8",
+    )
+    record_session_activity(
+        "sess-synth-fail",
+        transcript_path=str(transcript_path),
+        last_activity_ms=1000,
+        session_start_exported=True,
+    )
+
+    def fail_export(_config, _event):  # type: ignore[no-untyped-def]
+        raise RuntimeError("export unavailable")
+
+    monkeypatch.setattr("honeyhive_daemon.main.export_event", fail_export)
+    idle_ms = 24 * 60 * 60 * 1000
+    monkeypatch.setattr(
+        "honeyhive_daemon.main._now_ms",
+        lambda: 1000 + idle_ms + 1,
+    )
+
+    config = DaemonConfig(
+        api_key="hh_test",
+        base_url="https://api.honeyhive.ai",
+        project="demo",
+    )
+    _push_pending_session_artifacts(config)
+
+    index = load_session_index()
+    assert index["sess-synth-fail"].get("artifact_pushed") is not True
+    assert index["sess-synth-fail"].get("artifact_retry_count", 0) >= 1
+
+
+def test_push_pending_session_artifacts_synthesizes_orphan_session_end(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        '{"type":"user","message":{"role":"user","content":"hi"}}\n',
+        encoding="utf-8",
+    )
+    record_session_activity(
+        "sess-orphan",
+        transcript_path=str(transcript_path),
+        last_activity_ms=1000,
+        session_start_exported=True,
+    )
+
+    exported_events: list[dict] = []
+    monkeypatch.setattr(
+        "honeyhive_daemon.main.export_event",
+        lambda _config, event: exported_events.append(event),
+    )
+    monkeypatch.setattr(
+        "honeyhive_daemon.exporter.update_event_outputs",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        "honeyhive_daemon.exporter.update_event",
+        lambda *a, **kw: None,
+    )
+    idle_ms = 24 * 60 * 60 * 1000
+    monkeypatch.setattr(
+        "honeyhive_daemon.main._now_ms",
+        lambda: 1000 + idle_ms + 1,
+    )
+
+    config = DaemonConfig(
+        api_key="hh_test",
+        base_url="https://api.honeyhive.ai",
+        project="demo",
+    )
+    _push_pending_session_artifacts(config)
+
+    session_end_events = [
+        e for e in exported_events if e.get("event_name") == "session.end"
+    ]
+    assert len(session_end_events) == 1
+    assert session_end_events[0]["session_id"] == "sess-orphan"
+    assert session_end_events[0]["metadata"].get("synthetic") is True
+
+
+def test_push_pending_session_artifacts_stops_after_max_retries(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    monkeypatch.setattr("honeyhive_daemon.main._now_ms", lambda: 2000)
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        '{"type":"user","message":{"role":"user","content":"hi"}}\n',
+        encoding="utf-8",
+    )
+    record_session_activity(
+        "sess-retry-cap",
+        transcript_path=str(transcript_path),
+        last_activity_ms=1000,
+        ended=True,
+        session_end_event_id="sess-end-cap",
+    )
+
+    def fail_update_outputs(_config, *, event_id, outputs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("400 Bad Request")
+
+    monkeypatch.setattr(
+        "honeyhive_daemon.exporter.update_event_outputs",
+        fail_update_outputs,
+    )
+    monkeypatch.setattr(
+        "honeyhive_daemon.exporter.update_event",
+        lambda *a, **kw: None,
+    )
+
+    config = DaemonConfig(
+        api_key="hh_test",
+        base_url="https://api.honeyhive.ai",
+        project="demo",
+    )
+    for _ in range(4):
+        _push_pending_session_artifacts(config)
+
+    index = load_session_index()
+    assert index["sess-retry-cap"]["artifact_pushed"] is True
+    assert index["sess-retry-cap"].get("artifact_retry_count", 0) >= 3
 
 
 # ---------------------------------------------------------------------------

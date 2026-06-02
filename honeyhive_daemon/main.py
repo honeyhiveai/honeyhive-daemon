@@ -866,8 +866,24 @@ def _push_pending_session_artifacts(
 
         session_config = _resolve_session_config(session, config)
 
-        if not session.get("ended"):
+        needed_synthetic_end = not session.get("ended")
+        if needed_synthetic_end:
             session = _synthesize_session_end(session, session_config, transcript_path)
+        if needed_synthetic_end and not session.get("ended"):
+            retry_count = increment_session_artifact_retry(session["session_id"])
+            log_message(
+                "failed to close idle session before artifact push "
+                f"session_id={session['session_id']} "
+                f"retry={retry_count}/{ARTIFACT_MAX_RETRIES}"
+            )
+            if retry_count >= ARTIFACT_MAX_RETRIES:
+                mark_session_artifact_pushed(session["session_id"], _now_ms())
+                log_message(
+                    "giving up on session artifact after max retries "
+                    f"session_id={session['session_id']}"
+                )
+            continue
+
         transcript_content = _read_transcript_jsonl(transcript_path)
         if transcript_content is None:
             log_message(
