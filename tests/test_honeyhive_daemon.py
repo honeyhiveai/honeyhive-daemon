@@ -31,6 +31,7 @@ from honeyhive_daemon.state import (
     get_sessions_needing_artifact,
     load_session_index,
     mark_session_artifact_pushed,
+    read_spool_events,
     record_session_activity,
 )
 
@@ -857,6 +858,82 @@ def test_ingest_skills_listed_once_per_session(
     outputs = skills_events[0]["outputs"]
     assert outputs["names"] == ["plugin-skill", "hh-daemon-smoke"]
     assert outputs["count"] == 2
+
+
+def test_failed_skills_listed_export_is_spooled_once(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from honeyhive_daemon.config import save_config
+
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    skills_export_attempts: list[dict] = []
+    captured: list[dict] = []
+
+    class FakeEventsAPI:
+        def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
+            event = _nested_event_dict(request)
+            if event["event_name"] == "chain.skills.listed":
+                skills_export_attempts.append(event)
+                raise RuntimeError("export unavailable")
+            captured.append(event)
+
+    class FakeHoneyHive:
+        def __init__(self, api_key: str, base_url: str) -> None:
+            self.events = FakeEventsAPI()
+
+    monkeypatch.setattr("honeyhive_daemon.exporter.HoneyHive", FakeHoneyHive)
+    monkeypatch.setattr(
+        "honeyhive_daemon.main.resolve_config",
+        lambda **kw: kw.get("cli_defaults"),
+    )
+    save_config(
+        DaemonConfig(
+            api_key="hh_test",
+            base_url="https://api.honeyhive.ai",
+        )
+    )
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "attachment",
+                "attachment": {
+                    "type": "skill_listing",
+                    "names": ["hh-daemon-smoke"],
+                    "skillCount": 1,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    for tool_use_id in ("toolu_read", "toolu_bash"):
+        payload = json.dumps(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "sess-skills-fail",
+                "tool_name": "Read",
+                "tool_use_id": tool_use_id,
+                "tool_input": {"file_path": "README.md"},
+                "tool_response": {"stdout": "ok"},
+                "transcript_path": str(transcript),
+            }
+        )
+        result = runner.invoke(cli, ["ingest", "claude-hook"], input=payload)
+        assert result.exit_code == 0, result.output
+
+    assert len(skills_export_attempts) == 1
+    skills_spool = [
+        event
+        for event in read_spool_events()
+        if event.get("event_name") == "chain.skills.listed"
+    ]
+    assert len(skills_spool) == 1
+    tool_events = [event for event in captured if event["event_type"] == "tool"]
+    assert [event["event_name"] for event in tool_events] == ["tool.Read", "tool.Read"]
 
 
 def test_ingest_session_end_logs_session_id(

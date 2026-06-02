@@ -64,6 +64,7 @@ from .state import (
     append_chat_history,
     append_spool_event,
     claim_tool_usage_request_id,
+    drain_spool_events,
     get_chat_history,
     buffer_pending_tool_event,
     get_expired_tool_events,
@@ -76,8 +77,6 @@ from .state import (
     pop_pending_tool_event,
     read_spool_events,
     record_session_activity,
-    release_skills_listed_export,
-    replace_spool_events,
 )
 
 
@@ -815,7 +814,6 @@ def _maybe_export_skills_listed(
             f"count={listing['count']}"
         )
     except Exception as exc:
-        release_skills_listed_export(session_id)
         log_message(
             f"spooled skills listing session_id={session_id}: {exc}"
         )
@@ -846,7 +844,7 @@ def _apply_transcript_context(
 
 
 def _flush_spool(config: DaemonConfig) -> None:
-    pending = read_spool_events()
+    pending = drain_spool_events()
     if not pending:
         return
     log_message(f"flushing spool event_count={len(pending)}")
@@ -863,7 +861,8 @@ def _flush_spool(config: DaemonConfig) -> None:
             if stamped:
                 event["_resolved_config"] = stamped
             failed.append(event)
-    replace_spool_events(failed)
+    for event in failed:
+        append_spool_event(event)
     flushed = len(pending) - len(failed)
     log_message(f"flush complete flushed={flushed} remaining={len(failed)}")
 

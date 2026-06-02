@@ -364,8 +364,8 @@ EVALUATORS = [
         "enabled_in_prod": True,
         "filters": {
             "filterArray": [
-                {"field": "event_type", "operator": "is", "value": "session", "type": "string"},
-                {"field": "event_name", "operator": "is", "value": "session.start", "type": "string"},
+                {"field": "event_type", "operator": "is", "value": "chain", "type": "string"},
+                {"field": "event_name", "operator": "is", "value": "session.end", "type": "string"},
             ]
         },
     },
@@ -380,8 +380,8 @@ EVALUATORS = [
         "enabled_in_prod": True,
         "filters": {
             "filterArray": [
-                {"field": "event_type", "operator": "is", "value": "session", "type": "string"},
-                {"field": "event_name", "operator": "is", "value": "session.start", "type": "string"},
+                {"field": "event_type", "operator": "is", "value": "chain", "type": "string"},
+                {"field": "event_name", "operator": "is", "value": "session.end", "type": "string"},
             ]
         },
     },

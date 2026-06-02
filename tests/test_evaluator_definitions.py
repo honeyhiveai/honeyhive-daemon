@@ -52,6 +52,34 @@ def test_task_completion_runs_on_session_start() -> None:
     } in filters
 
 
+def test_artifact_based_python_evaluators_run_on_session_end() -> None:
+    artifact_evaluators = [
+        "Coding Agent - Bash Ratio",
+        "Coding Agent - Bash Edit Misuse",
+        "Coding Agent - File Search Spam",
+        "Coding Agent - Permission Bottleneck",
+        "Coding Agent - Subagent Lifecycle",
+        "Coding Agent - Session Event Count",
+        "Coding Agent - Tool to Model Ratio",
+    ]
+
+    for name in artifact_evaluators:
+        evaluator = next(evaluator for evaluator in EVALUATORS if evaluator["name"] == name)
+        filters = evaluator["filters"]["filterArray"]
+        assert {
+            "field": "event_type",
+            "operator": "is",
+            "value": "chain",
+            "type": "string",
+        } in filters
+        assert {
+            "field": "event_name",
+            "operator": "is",
+            "value": "session.end",
+            "type": "string",
+        } in filters
+
+
 def test_python_evaluators_read_nested_claude_tool_use_blocks() -> None:
     event = {
         "outputs": {

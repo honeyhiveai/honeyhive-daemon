@@ -26,10 +26,62 @@ def log_message(message: str) -> None:
         handle.write(f"{timestamp} {message}\n")
 
 
+@contextmanager
+def _locked_text_file(path):
+    """Open a state text file under an exclusive lock."""
+    ensure_state_layout()
+    if not path.exists():
+        path.write_text("", encoding="utf-8")
+    with path.open("r+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield handle
+            handle.flush()
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _locked_json_mapping(path, malformed_message: str) -> Iterator[Dict[str, Any]]:
+    """Load and save a JSON object state file under an exclusive lock."""
+    ensure_state_layout()
+    if not path.exists():
+        path.write_text("{}\n", encoding="utf-8")
+    with path.open("r+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            raw = handle.read()
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except json.JSONDecodeError:
+                log_message(malformed_message)
+                data = {}
+            yield data
+            handle.seek(0)
+            handle.truncate()
+            handle.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _parse_spool_lines(lines: list[str]) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            log_message("skipped malformed spool line")
+    return events
+
+
 def append_spool_event(event: Dict[str, Any]) -> None:
     """Append a failed event to the local spool."""
-    ensure_state_layout()
-    with get_spool_path().open("a", encoding="utf-8") as handle:
+    with _locked_text_file(get_spool_path()) as handle:
+        handle.seek(0, 2)
         handle.write(json.dumps(event, sort_keys=True) + "\n")
 
 
@@ -38,24 +90,24 @@ def read_spool_events() -> List[Dict[str, Any]]:
     path = get_spool_path()
     if not path.exists():
         return []
-    events: List[Dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                log_message("skipped malformed spool line")
-    return events
+    with _locked_text_file(path) as handle:
+        return _parse_spool_lines(handle.readlines())
+
+
+def drain_spool_events() -> List[Dict[str, Any]]:
+    """Atomically return and clear pending spool events."""
+    with _locked_text_file(get_spool_path()) as handle:
+        events = _parse_spool_lines(handle.readlines())
+        handle.seek(0)
+        handle.truncate()
+        return events
 
 
 def replace_spool_events(events: List[Dict[str, Any]]) -> None:
     """Replace the current spool with unsent events."""
-    ensure_state_layout()
-    path = get_spool_path()
-    with path.open("w", encoding="utf-8") as handle:
+    with _locked_text_file(get_spool_path()) as handle:
+        handle.seek(0)
+        handle.truncate()
         for event in events:
             handle.write(json.dumps(event, sort_keys=True) + "\n")
 
@@ -162,11 +214,8 @@ def _load_chat_histories() -> Dict[str, List[Dict[str, str]]]:
     path = get_chat_histories_path()
     if not path.exists():
         return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        log_message("skipped malformed chat histories index")
-        return {}
+    with _locked_json_mapping(path, "skipped malformed chat histories index") as index:
+        return dict(index)
 
 
 def _save_chat_histories(index: Dict[str, List[Dict[str, str]]]) -> None:
@@ -241,12 +290,13 @@ def append_chat_history(
     session_id: str, role: str, content: str
 ) -> List[Dict[str, str]]:
     """Append a message to a session's chat history and return the history including the new message."""
-    index = _load_chat_histories()
-    history = list(index.get(session_id, []))
-    history.append({"role": role, "content": content})
-    index[session_id] = history
-    _save_chat_histories(index)
-    return list(history)
+    with _locked_json_mapping(
+        get_chat_histories_path(), "skipped malformed chat histories index"
+    ) as index:
+        history = list(index.get(session_id, []))
+        history.append({"role": role, "content": content})
+        index[session_id] = history
+        return list(history)
 
 
 def increment_session_artifact_retry(session_id: str) -> int:
@@ -266,11 +316,8 @@ def _load_pending_tools() -> Dict[str, Dict[str, Any]]:
     path = get_pending_tools_path()
     if not path.exists():
         return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        log_message("skipped malformed pending tools index")
-        return {}
+    with _locked_json_mapping(path, "skipped malformed pending tools index") as index:
+        return dict(index)
 
 
 def _save_pending_tools(index: Dict[str, Dict[str, Any]]) -> None:
@@ -286,37 +333,35 @@ def buffer_pending_tool_event(
     session_id: str, tool_use_id: str, event: Dict[str, Any]
 ) -> None:
     """Buffer a pre-phase tool event waiting for its post-phase counterpart."""
-    index = _load_pending_tools()
-    key = f"{session_id}:{tool_use_id}"
-    index[key] = event
-    _save_pending_tools(index)
+    with _locked_json_mapping(
+        get_pending_tools_path(), "skipped malformed pending tools index"
+    ) as index:
+        key = f"{session_id}:{tool_use_id}"
+        index[key] = event
 
 
 def pop_pending_tool_event(
     session_id: str, tool_use_id: str
 ) -> Dict[str, Any] | None:
     """Pop a buffered pre-phase tool event for merging with its post-phase."""
-    index = _load_pending_tools()
-    key = f"{session_id}:{tool_use_id}"
-    event = index.pop(key, None)
-    if event is not None:
-        _save_pending_tools(index)
-    return event
+    with _locked_json_mapping(
+        get_pending_tools_path(), "skipped malformed pending tools index"
+    ) as index:
+        key = f"{session_id}:{tool_use_id}"
+        return index.pop(key, None)
 
 
 def get_expired_tool_events(*, now_ms: int, timeout_ms: int = 60_000) -> List[Dict[str, Any]]:
     """Return and remove tool events buffered longer than timeout_ms."""
-    index = _load_pending_tools()
-    expired: List[Dict[str, Any]] = []
-    remaining: Dict[str, Dict[str, Any]] = {}
-    for key, event in index.items():
-        if now_ms - int(event.get("start_time", 0)) >= timeout_ms:
-            expired.append(event)
-        else:
-            remaining[key] = event
-    if expired:
-        _save_pending_tools(remaining)
-    return expired
+    with _locked_json_mapping(
+        get_pending_tools_path(), "skipped malformed pending tools index"
+    ) as index:
+        expired: List[Dict[str, Any]] = []
+        for key, event in list(index.items()):
+            if now_ms - int(event.get("start_time", 0)) >= timeout_ms:
+                expired.append(event)
+                index.pop(key, None)
+        return expired
 
 
 def get_sessions_needing_artifact(
