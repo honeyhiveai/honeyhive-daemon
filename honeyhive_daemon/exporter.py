@@ -140,7 +140,6 @@ def _build_event_payload(
     event_config.update(session_config)
 
     event_payload: Dict[str, Any] = {
-        "project": config.project,
         "event_id": str(event["event_id"]),
         "session_id": str(event["session_id"]),
         "event_type": str(event["event_type"]),

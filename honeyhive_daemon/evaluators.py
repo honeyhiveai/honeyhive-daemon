@@ -10,7 +10,7 @@ from typing import Optional
 import click
 import httpx
 
-from .config import DEFAULT_BASE_URL, find_project_root, load_project_config
+from .config import DEFAULT_BASE_URL, find_project_root
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +129,10 @@ def _build_leakage_code() -> str:
 # HoneyHive evaluator API helpers
 # ---------------------------------------------------------------------------
 
-def _list_evaluators(url: str, key: str, project: str) -> list:
+def _list_evaluators(url: str, key: str) -> list:
     resp = httpx.get(
         f"{url.rstrip('/')}/v1/metrics",
         headers={"Authorization": f"Bearer {key}"},
-        params={"project": project},
         timeout=15.0,
     )
     resp.raise_for_status()
@@ -168,15 +167,22 @@ def _evaluator_exists(evaluators: list, name: str) -> Optional[str]:
 # Evaluator definitions
 # ---------------------------------------------------------------------------
 
-def _safe_project_slug(project: str) -> str:
-    """Convert a project name to a slug safe for HH evaluator names."""
-    slug = re.sub(r"[^a-zA-Z0-9_\- ]", "", project).strip()
-    return slug[:40] if slug else "project"
+def _safe_slug(name: str) -> str:
+    """Convert a repo or label string to a slug safe for HH evaluator names."""
+    slug = re.sub(r"[^a-zA-Z0-9_\- ]", "", name).strip()
+    return slug[:40] if slug else "repo"
 
 
-def _claudemd_evaluator(project: str, instructions: str) -> dict:
+def _repo_slug(cwd: Optional[Path] = None) -> str:
+    """Directory name slug for per-repo evaluator metric names."""
+    base = cwd or Path.cwd()
+    root = find_project_root(str(base))
+    name = root.name if root else base.name
+    return _safe_slug(name)
+
+
+def _claudemd_evaluator(slug: str, instructions: str) -> dict:
     instructions_block = _truncate_instructions(instructions)
-    slug = _safe_project_slug(project)
     prompt = (
         "You are auditing a Claude Code session to check if the AI agent followed "
         "its project instructions.\n\n"
@@ -218,8 +224,7 @@ def _claudemd_evaluator(project: str, instructions: str) -> dict:
     }
 
 
-def _leakage_evaluator(project: str) -> dict:
-    slug = _safe_project_slug(project)
+def _leakage_evaluator(slug: str) -> dict:
     return {
         "name": f"Sensitive Data Leakage - {slug}",
         "type": "PYTHON",
@@ -237,12 +242,6 @@ def _leakage_evaluator(project: str) -> dict:
 # ---------------------------------------------------------------------------
 
 @click.command("push-evaluators")
-@click.option(
-    "--project", "-p",
-    envvar="HH_PROJECT",
-    default=None,
-    help="HoneyHive project name (falls back to .honeyhive/config.json).",
-)
 @click.option(
     "--file", "-f",
     "instruction_file",
@@ -276,7 +275,6 @@ def _leakage_evaluator(project: str) -> dict:
     help="Skip creating the instruction adherence evaluator.",
 )
 def push_evaluators_cmd(
-    project: Optional[str],
     instruction_file: Optional[Path],
     url: str,
     key: Optional[str],
@@ -300,22 +298,12 @@ def push_evaluators_cmd(
 
       honeyhive-daemon push-evaluators
 
-      honeyhive-daemon push-evaluators --file path/to/CLAUDE.md --project my-project
+      honeyhive-daemon push-evaluators --file path/to/CLAUDE.md
 
       honeyhive-daemon push-evaluators --skip-adherence  # only leakage detector
     """
     cwd = Path.cwd()
-
-    # Resolve project
-    if not project:
-        root = find_project_root(str(cwd))
-        if root:
-            cfg = load_project_config(root)
-            project = cfg.get("project")
-    if not project:
-        raise click.UsageError(
-            "No project found. Pass --project or run 'honeyhive-daemon init' first."
-        )
+    slug = _repo_slug(cwd)
 
     if not key:
         raise click.UsageError(
@@ -336,7 +324,7 @@ def push_evaluators_cmd(
 
     # Fetch existing evaluators for idempotency check
     try:
-        existing = _list_evaluators(url, key, project)
+        existing = _list_evaluators(url, key)
     except httpx.HTTPStatusError as exc:
         raise click.ClickException(
             f"HoneyHive API error {exc.response.status_code}: {exc.response.text[:200]}"
@@ -344,8 +332,8 @@ def push_evaluators_cmd(
     except httpx.RequestError as exc:
         raise click.ClickException(f"Network error: {exc}")
 
-    click.echo(f"\nProject: {project}")
-    click.echo(f"API:     {url}\n")
+    click.echo(f"\nRepo slug: {slug}")
+    click.echo(f"API:       {url}\n")
     results: list[tuple[str, str, str]] = []  # (evaluator_name, status, metric_id)
 
     # -------------------------------------------------------------------------
@@ -353,7 +341,7 @@ def push_evaluators_cmd(
     # -------------------------------------------------------------------------
     if not skip_adherence and instr_path:
         instructions = instr_path.read_text(encoding="utf-8")
-        adherence_def = _claudemd_evaluator(project, instructions)
+        adherence_def = _claudemd_evaluator(slug, instructions)
         adherence_name = adherence_def["name"]
 
         existing_id = _evaluator_exists(existing, adherence_name)
@@ -382,7 +370,7 @@ def push_evaluators_cmd(
     # 2. Sensitive data leakage evaluator
     # -------------------------------------------------------------------------
     if not skip_leakage:
-        leakage_def = _leakage_evaluator(project)
+        leakage_def = _leakage_evaluator(slug)
         leakage_name = leakage_def["name"]
 
         existing_id = _evaluator_exists(existing, leakage_name)
@@ -414,6 +402,6 @@ def push_evaluators_cmd(
     click.echo(f"Done — {created} created, {skipped} already existed, {errors} failed.")
     if created or skipped:
         click.echo(
-            f"\nEvaluators now run automatically on every new session in '{project}'.\n"
+            f"\nEvaluators now run automatically on every new session (API-key scope).\n"
             f"View results at: {url.rstrip('/')}/evaluate\n"
         )

@@ -104,12 +104,6 @@ def cli() -> None:
     help="HoneyHive base URL or OTLP traces endpoint.",
 )
 @click.option(
-    "--project",
-    envvar="HH_PROJECT",
-    default=None,
-    help="HoneyHive project override (deprecated — use 'honeyhive-daemon init').",
-)
-@click.option(
     "--repo",
     type=click.Path(file_okay=False, path_type=Path),
     help="Repo to attach git commit events to.",
@@ -120,7 +114,6 @@ def run(
     ctx: click.Context,
     api_key: Optional[str],
     base_url: str,
-    project: Optional[str],
     repo: Optional[Path],
     ci: bool,
 ) -> None:
@@ -135,21 +128,11 @@ def run(
     key_from_cli = (
         ctx.get_parameter_source("api_key") == click.core.ParameterSource.COMMANDLINE
     )
-    project_from_cli = (
-        ctx.get_parameter_source("project") == click.core.ParameterSource.COMMANDLINE
-    )
-
     if key_from_cli:
         click.echo(
             "Warning: --key is deprecated. "
             "Use 'honeyhive-daemon init' to set up per-project config."
         )
-    if project_from_cli:
-        click.echo(
-            "Warning: --project is deprecated. "
-            "Use 'honeyhive-daemon init' to set up per-project config."
-        )
-
     # --- Migrate CLI-provided key to user-level config --------------------
     if api_key and key_from_cli:
         user_data: dict = {"api_key_env": "HH_API_KEY"}
@@ -182,8 +165,6 @@ def run(
         legacy = load_config()
         if legacy and legacy.api_key:
             api_key = legacy.api_key
-            if not project:
-                project = legacy.project
 
     if not api_key:
         click.echo(
@@ -195,22 +176,9 @@ def run(
         )
         raise SystemExit(1)
 
-    # --- Fallback chain for project ---------------------------------------
-    if not project:
-        user_cfg = load_user_config()
-        project = user_cfg.get("project")
-
-    if not project:
-        legacy = load_config()
-        if legacy and legacy.project:
-            project = legacy.project
-
-    resolved_project = project or _derive_project_name(repo_root)
-
     config = DaemonConfig(
         api_key=api_key,
         base_url=base_url,
-        project=resolved_project,
         repo_path=str(repo_root) if repo_root else None,
         ci=ci,
     )
@@ -228,7 +196,6 @@ def run(
 
     log_message(
         "daemon started "
-        f"project={resolved_project} "
         f"repo={repo_root or '-'} "
         f"ci={ci}"
     )
@@ -237,7 +204,6 @@ def run(
     click.echo(f"Daemon home: {get_daemon_home()}")
     click.echo(f"Filters: {filters_path}")
     click.echo(f"Claude settings: {settings_path}")
-    click.echo(f"Project: {resolved_project}")
     if repo_root is not None:
         click.echo(f"Repo: {repo_root}")
     click.echo(f"Claude hooks {'updated' if hooks_changed else 'already installed'}")
@@ -283,10 +249,9 @@ def run(
 
 
 @cli.command()
-@click.option("--project", "-p", required=True, help="HoneyHive project name")
 @click.option("--api-key-env", default="HH_API_KEY", help="Env var holding the API key")
 @click.option("--url", default=None, help="HoneyHive API base URL (for self-hosted / non-default endpoints)")
-def init(project: str, api_key_env: str, url: str | None) -> None:
+def init(api_key_env: str, url: str | None) -> None:
     """Initialize .honeyhive/ config in the current directory."""
     cwd = Path.cwd()
     hh_dir = cwd / ".honeyhive"
@@ -296,12 +261,8 @@ def init(project: str, api_key_env: str, url: str | None) -> None:
 
     hh_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write project config
-    project_config_path = hh_dir / "config.json"
-    project_config_path.write_text(
-        json.dumps({"project": project}, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    # Marker file (committed); secrets live in config.local.json
+    (hh_dir / "config.json").write_text("{}\n", encoding="utf-8")
 
     # Write local config (not committed)
     local_config: dict[str, str] = {"api_key_env": api_key_env}
@@ -331,7 +292,7 @@ def init(project: str, api_key_env: str, url: str | None) -> None:
         gitignore_path.write_text(local_pattern + "\n", encoding="utf-8")
 
     click.echo(f"Created {hh_dir}/")
-    click.echo(f"  config.json        → project: {project}")
+    click.echo("  config.json        → (empty; project is resolved from your API key)")
     click.echo(f"  config.local.json  → api_key_env: {api_key_env}")
     click.echo(f"Updated {gitignore_path}")
 
@@ -353,7 +314,6 @@ def status() -> None:
         for reason, count in reasons.items():
             click.echo(f"  Spool reason ({count}x): {reason}")
     if config:
-        click.echo(f"Project: {config.project}")
         click.echo(f"Base URL: {config.base_url}")
         click.echo(f"Repo: {config.repo_path or '-'}")
 
@@ -992,15 +952,6 @@ def _settings_have_command(settings_path: Path) -> bool:
                 ):
                     return True
     return False
-
-
-def _derive_project_name(repo_root: Optional[Path]) -> str:
-    env_project = os.getenv("HH_PROJECT")
-    if env_project:
-        return env_project
-    if repo_root is not None:
-        return repo_root.name
-    return Path.cwd().name
 
 
 def _resolve_repo(repo: Optional[Path]) -> Optional[Path]:

@@ -32,18 +32,24 @@ A local daemon that captures Claude Code activity via hooks and exports structur
 pip install honeyhive-daemon
 
 # In your project repo
-honeyhive-daemon init --project my-project --url https://api.dp1.us.prod.honeyhive.ai
+honeyhive-daemon init
 # Creates .honeyhive/config.json and .honeyhive/config.local.json
 
 export HH_API_KEY=your-key
+export HH_API_URL=https://api.dp1.us.prod.honeyhive.ai  # omit if using the default endpoint
 
 honeyhive-daemon run
 ```
 
+Project is resolved from your API key on HoneyHive — you do not need to pass `--project` on `init` or `run`.
+
 **Single-project (legacy):**
 
 ```bash
-honeyhive-daemon run --key $HH_API_KEY --project my-project
+export HH_API_KEY=your-key
+export HH_API_URL=https://api.dp1.us.prod.honeyhive.ai
+
+honeyhive-daemon run --key $HH_API_KEY
 ```
 
 The daemon stores local state in `~/.honeyhive/daemon/` and installs Claude hooks in `~/.claude/settings.json`.
@@ -117,7 +123,7 @@ All daemon state lives under `~/.honeyhive/daemon/` (override with `HH_DAEMON_HO
 
 | Command | Description |
 |---------|-------------|
-| `honeyhive-daemon init` | Scaffold `.honeyhive/config.json` + `.honeyhive/config.local.json` in the current repo. Accepts `--url` to persist a custom API endpoint. |
+| `honeyhive-daemon init` | Scaffold `.honeyhive/` in the current repo (API key env var reference). Set `HH_API_URL` in the environment for non-default endpoints; project comes from your API key. |
 | `honeyhive-daemon run` | Start the daemon, install hooks, and flush queued events. |
 | `honeyhive-daemon stop` | Stop the running daemon. |
 | `honeyhive-daemon status` | Show config, pending spool event count, and failure reasons for spooled events. |
@@ -131,7 +137,6 @@ All daemon state lives under `~/.honeyhive/daemon/` (override with `HH_DAEMON_HO
 |------|---------|-------------|
 | `--key` | `HH_API_KEY` | HoneyHive API key (required). |
 | `--url` | `HH_API_URL` | Data plane URL (default: `https://api.dp1.us.prod.honeyhive.ai`). |
-| `--project` | `HH_PROJECT` | HoneyHive project name (default: repo/directory name). |
 | `--repo PATH` | | Git repo to attach commit events to. |
 | `--ci` | | Enable CI mode. |
 
@@ -139,7 +144,6 @@ All daemon state lives under `~/.honeyhive/daemon/` (override with `HH_DAEMON_HO
 
 | Flag | Env var | Description |
 |------|---------|-------------|
-| `--project`, `-p` | `HH_PROJECT` | HoneyHive project name. Falls back to `.honeyhive/config.json`. |
 | `--since` | | Time window: `24h`, `7d`, `2w`. Default `24h`. |
 | `--out`, `-o` | | Output path (`-` for stdout). Default `-`. |
 | `--url` | `HH_API_URL` | HoneyHive base URL. |
@@ -156,7 +160,6 @@ honeyhive-daemon analyze --since 7d --out patterns.json
 | Flag | Description |
 |------|-------------|
 | `--cadence` | `hourly` / `daily` / `weekly`. Default `daily`. |
-| `--project`, `-p` | HoneyHive project name. Falls back to `.honeyhive/config.json`. |
 | `--output-dir` | Where to write the workflow file. Default `.github/workflows/` in cwd. |
 
 Writes `.github/workflows/hh-proactive-improvements.yml` and scaffolds `.honeyhive/error-categories.json` if missing. The workflow runs `honeyhive-daemon analyze` on the chosen cadence, then invokes Claude Code to open PRs for any actionable patterns.
@@ -178,7 +181,7 @@ If events aren't showing up in HoneyHive, work through these checks in order:
 
 1. **Is the daemon running?** Check `~/.honeyhive/daemon/daemon.pid` and verify the process is alive with `ps`.
 2. **Check the log.** `tail -100 ~/.honeyhive/daemon/daemon.log` — look for `spooled` (export failures) or missing `received claude hook` entries.
-3. **Verify config.** `cat ~/.honeyhive/daemon/state/config.json` — confirm API key, project, and base URL are correct.
+3. **Verify config.** `cat ~/.honeyhive/daemon/state/config.json` — confirm API key and base URL are correct.
 4. **Hooks installed?** Run `honeyhive-daemon doctor` or inspect `~/.claude/settings.json` for the hook command.
 5. **Spool buildup?** `wc -l ~/.honeyhive/daemon/spool/events.jsonl` — if events are piling up, check the `spool_reason` field for error details.
 6. **PATH issues.** Ensure `honeyhive-daemon` is on PATH in the shell context Claude Code uses (`which honeyhive-daemon`). Virtualenv installations may not be visible to hooks.

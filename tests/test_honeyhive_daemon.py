@@ -452,7 +452,7 @@ def test_cli_status_without_config(monkeypatch, tmp_path: Path) -> None:
     assert "Pending spool events: 0" in result.output
 
 
-def test_cli_status_shows_configured_project(
+def test_cli_status_shows_configured_base_url(
     monkeypatch, tmp_path: Path
 ) -> None:
     from honeyhive_daemon.config import save_config
@@ -462,13 +462,12 @@ def test_cli_status_shows_configured_project(
         DaemonConfig(
             api_key="hh_test",
             base_url="https://api.honeyhive.ai",
-            project="my-folder-name",
         )
     )
 
     result = CliRunner().invoke(cli, ["status"])
     assert result.exit_code == 0
-    assert "my-folder-name" in result.output
+    assert "https://api.honeyhive.ai" in result.output
 
 
 def test_cli_status_shows_spool_failure_reason(
@@ -522,7 +521,7 @@ def test_ingest_session_end_logs_session_id(
         DaemonConfig(
             api_key="hh_test",
             base_url="https://api.honeyhive.ai",
-            project="demo",
+            
         )
     )
 
@@ -563,7 +562,7 @@ def test_export_session_event_includes_session_name(monkeypatch, tmp_path: Path)
     config = DaemonConfig(
         api_key="hh_test",
         base_url="https://api.honeyhive.ai",
-        project="test-project",
+        
     )
     event = {
         "event_id": "sess-1",
@@ -603,7 +602,7 @@ def test_export_tool_event_no_session_name_field(monkeypatch, tmp_path: Path) ->
     config = DaemonConfig(
         api_key="hh_test",
         base_url="https://api.honeyhive.ai",
-        project="test-project",
+        
     )
     event = {
         "event_id": "evt-1",
@@ -645,7 +644,7 @@ def test_export_event_posts_honeyhive_event(monkeypatch, tmp_path: Path) -> None
     config = DaemonConfig(
         api_key="hh_test",
         base_url="https://api.honeyhive.ai",
-        project="ignored-project",
+        
     )
     event = {
         "event_id": "evt-1",
@@ -667,7 +666,7 @@ def test_export_event_posts_honeyhive_event(monkeypatch, tmp_path: Path) -> None
     assert captured["api_key"] == "hh_test"
     assert captured["base_url"] == "https://api.honeyhive.ai"
     assert captured["event"]["event_id"] == "evt-1"
-    assert captured["event"]["project"] == "ignored-project"
+    assert not captured["event"].get("project")
     assert captured["event"]["event_type"] == "tool"
     assert captured["event"]["event_name"] == "tool.bash"
     assert captured["event"]["parent_id"] == "sess-1"
@@ -714,7 +713,6 @@ def test_push_pending_session_artifacts_updates_root_event(
     def fake_update_event_outputs(config, *, event_id, outputs):  # type: ignore[no-untyped-def]
         captured.append(
             {
-                "project": config.project,
                 "event_id": event_id,
                 "outputs": outputs,
             }
@@ -755,13 +753,13 @@ def test_push_pending_session_artifacts_updates_root_event(
     config = DaemonConfig(
         api_key="hh_test",
         base_url="https://api.honeyhive.ai",
-        project="demo",
+        
     )
     _push_pending_session_artifacts(config)
 
     # Root event gets chat_history, end event gets full artifact
     assert [item["event_id"] for item in captured] == ["sess-root-1", "sess-end-1"]
-    assert all(item["project"] == "demo" for item in captured)
+    assert len(captured) == 2
     # Root event: chat_history only
     assert "chat_history" in captured[0]["outputs"]
     assert captured[0]["outputs"]["chat_history"] == [{"role": "user", "content": "hi"}]
@@ -807,7 +805,7 @@ def test_push_pending_session_artifacts_retries_when_synthetic_session_end_fails
     config = DaemonConfig(
         api_key="hh_test",
         base_url="https://api.honeyhive.ai",
-        project="demo",
+        
     )
     _push_pending_session_artifacts(config)
 
@@ -854,7 +852,7 @@ def test_push_pending_session_artifacts_synthesizes_orphan_session_end(
     config = DaemonConfig(
         api_key="hh_test",
         base_url="https://api.honeyhive.ai",
-        project="demo",
+        
     )
     _push_pending_session_artifacts(config)
 
@@ -900,7 +898,7 @@ def test_push_pending_session_artifacts_stops_after_max_retries(
     config = DaemonConfig(
         api_key="hh_test",
         base_url="https://api.honeyhive.ai",
-        project="demo",
+        
     )
     for _ in range(4):
         _push_pending_session_artifacts(config)
