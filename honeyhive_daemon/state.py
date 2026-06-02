@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List
 
 from .config import (
     ensure_state_layout,
@@ -79,6 +81,31 @@ def save_session_index(index: Dict[str, Dict[str, Any]]) -> None:
     )
 
 
+@contextmanager
+def _locked_session_index() -> Iterator[Dict[str, Dict[str, Any]]]:
+    """Load the session index under an exclusive lock for read-modify-write."""
+    ensure_state_layout()
+    path = get_sessions_path()
+    if not path.exists():
+        path.write_text("{}\n", encoding="utf-8")
+    with path.open("r+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            raw = handle.read()
+            try:
+                index = json.loads(raw) if raw.strip() else {}
+            except json.JSONDecodeError:
+                log_message("skipped malformed session index")
+                index = {}
+            yield index
+            handle.seek(0)
+            handle.truncate()
+            handle.write(json.dumps(index, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def record_session_activity(
     session_id: str,
     *,
@@ -91,45 +118,43 @@ def record_session_activity(
     session_name: str | None = None,
 ) -> Dict[str, Any]:
     """Update local state for one Claude session."""
-    index = load_session_index()
-    is_new = session_id not in index
-    session = index.get(session_id, {})
-    session["session_id"] = session_id
-    session["event_id"] = session_id
-    session["last_activity_ms"] = last_activity_ms
-    if transcript_path:
-        session["transcript_path"] = transcript_path
-    if cwd:
-        session["cwd"] = cwd
-    if session_name:
-        session["session_name"] = session_name
-    if ended:
-        session["ended"] = True
-        # Reset artifact_pushed so the background loop re-uploads the
-        # transcript if the session was resumed after a previous push.
-        session["artifact_pushed"] = False
-    if session_end_event_id:
-        session["session_end_event_id"] = session_end_event_id
-    if session_start_exported is not None:
-        session["session_start_exported"] = session_start_exported
-    session.setdefault("session_start_exported", False)
-    session.setdefault("artifact_pushed", False)
-    session["_is_new"] = is_new
-    index[session_id] = session
-    save_session_index(index)
-    return session
+    with _locked_session_index() as index:
+        is_new = session_id not in index
+        session = index.get(session_id, {})
+        session["session_id"] = session_id
+        session["event_id"] = session_id
+        session["last_activity_ms"] = last_activity_ms
+        if transcript_path:
+            session["transcript_path"] = transcript_path
+        if cwd:
+            session["cwd"] = cwd
+        if session_name:
+            session["session_name"] = session_name
+        if ended:
+            session["ended"] = True
+            # Reset artifact_pushed so the background loop re-uploads the
+            # transcript if the session was resumed after a previous push.
+            session["artifact_pushed"] = False
+        if session_end_event_id:
+            session["session_end_event_id"] = session_end_event_id
+        if session_start_exported is not None:
+            session["session_start_exported"] = session_start_exported
+        session.setdefault("session_start_exported", False)
+        session.setdefault("artifact_pushed", False)
+        session["_is_new"] = is_new
+        index[session_id] = session
+        return dict(session)
 
 
 def mark_session_artifact_pushed(session_id: str, pushed_at_ms: int) -> None:
     """Mark a session's transcript artifact as already pushed upstream."""
-    index = load_session_index()
-    session = index.get(session_id)
-    if session is None:
-        return
-    session["artifact_pushed"] = True
-    session["artifact_pushed_at_ms"] = pushed_at_ms
-    index[session_id] = session
-    save_session_index(index)
+    with _locked_session_index() as index:
+        session = index.get(session_id)
+        if session is None:
+            return
+        session["artifact_pushed"] = True
+        session["artifact_pushed_at_ms"] = pushed_at_ms
+        index[session_id] = session
 
 
 def _load_chat_histories() -> Dict[str, List[Dict[str, str]]]:
@@ -158,6 +183,60 @@ def get_chat_history(session_id: str) -> List[Dict[str, str]]:
     return list(_load_chat_histories().get(session_id, []))
 
 
+def claim_skills_listed_export(session_id: str) -> bool:
+    """Atomically claim the one chain.skills.listed export slot for a session."""
+    with _locked_session_index() as index:
+        session = index.setdefault(
+            session_id,
+            {
+                "session_id": session_id,
+                "event_id": session_id,
+                "session_start_exported": False,
+                "artifact_pushed": False,
+            },
+        )
+        if session.get("skills_listed_exported"):
+            return False
+        session["skills_listed_exported"] = True
+        return True
+
+
+def release_skills_listed_export(session_id: str) -> None:
+    """Release a skills-listing export claim after a failed export attempt."""
+    with _locked_session_index() as index:
+        session = index.get(session_id)
+        if session is None:
+            return
+        session["skills_listed_exported"] = False
+
+
+def claim_tool_usage_request_id(session_id: str, request_id: str) -> bool:
+    """Return True if usage for this API request may be attached to a tool event.
+
+    Claude Code may emit multiple tool events from one API call; usage should
+    appear on only the first tool event for that request_id.
+    """
+    if not request_id:
+        return True
+    with _locked_session_index() as index:
+        session = index.setdefault(
+            session_id,
+            {
+                "session_id": session_id,
+                "event_id": session_id,
+                "session_start_exported": False,
+                "artifact_pushed": False,
+            },
+        )
+        used = set(session.get("tool_usage_request_ids", []))
+        if request_id in used:
+            return False
+        used.add(request_id)
+        session["tool_usage_request_ids"] = sorted(used)
+        index[session_id] = session
+        return True
+
+
 def append_chat_history(
     session_id: str, role: str, content: str
 ) -> List[Dict[str, str]]:
@@ -172,15 +251,14 @@ def append_chat_history(
 
 def increment_session_artifact_retry(session_id: str) -> int:
     """Increment and return the artifact retry count for a session."""
-    index = load_session_index()
-    session = index.get(session_id)
-    if session is None:
-        return 0
-    count = session.get("artifact_retry_count", 0) + 1
-    session["artifact_retry_count"] = count
-    index[session_id] = session
-    save_session_index(index)
-    return count
+    with _locked_session_index() as index:
+        session = index.get(session_id)
+        if session is None:
+            return 0
+        count = session.get("artifact_retry_count", 0) + 1
+        session["artifact_retry_count"] = count
+        index[session_id] = session
+        return count
 
 
 def _load_pending_tools() -> Dict[str, Dict[str, Any]]:

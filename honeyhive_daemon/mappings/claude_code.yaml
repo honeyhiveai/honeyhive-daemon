@@ -408,9 +408,9 @@ event_mappings:
         instructions.load_reason: load_reason
         instructions.memory_type: memory_type
         instructions.trigger_file_path: trigger_file_path
-    inputs:
-      from_payload:
-        globs: globs
+        instructions.parent_file_path: parent_file_path
+        instructions.globs: globs
+    inputs: {}
 
   UserPromptSubmit:
     event_type: model

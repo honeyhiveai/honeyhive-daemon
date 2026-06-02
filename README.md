@@ -74,9 +74,11 @@ Each Claude Code session produces a tree of events in HoneyHive:
 | Event name | Type | Description |
 |------------|------|-------------|
 | `session.start` | `session` | Root event. All other events are children of this. |
-| `turn.user` | `model` | User prompt. `inputs.chat_history` accumulates the full conversation so far; `outputs.content` is the new message. |
-| `turn.agent` | `model` | Assistant response. `inputs.chat_history` accumulates the full conversation so far; `outputs.content` is the new message. |
+| `turn.user` | `model` | User prompt. `inputs.chat_history` is prior turns only; `outputs.content` is this message. |
+| `turn.agent` | `model` | Assistant response. `inputs.chat_history` is prior turns only; `outputs.content` is this message. |
 | `tool.{ToolName}` | `tool` | Tool use (e.g. `tool.Bash`, `tool.Edit`, `tool.Read`, `tool.Grep`). Pre and post hooks are merged into a single event with `start_time`/`end_time` duration. |
+| `chain.instructions.loaded` | `chain` | `CLAUDE.md` or `.claude/rules/*.md` loaded into context ([InstructionsLoaded](https://code.claude.com/docs/en/hooks)). `outputs.content` is read from disk at ingest; metadata has `file.path`, `instructions.memory_type`, `instructions.load_reason`. Does not cover skills or prompt expansion. |
+| `chain.skills.listed` | `chain` | Skills discovered for the session. `outputs.names` and `outputs.count` come from the transcript `skill_listing` attachment. Separate from InstructionsLoaded. |
 | `session.end` | `chain` | Marks session completion. |
 | `chain.commit_link` | `chain` | Git commit metadata (requires `--repo`). |
 
@@ -84,10 +86,11 @@ Tool events include `inputs.thinking` when a reasoning block precedes the tool c
 
 #### Session artifacts
 
-When a session ends (or goes idle), the daemon pushes two different views of the conversation:
+When a session ends (or goes idle), the daemon pushes final session views:
 
-- **`session.start`** receives `outputs.chat_history` — this is the user-facing conversation: the back-and-forth of user messages and assistant responses, basically what you'd see in the chat UI. Useful for reviewing what was said and evaluating response quality.
-- **`session.end`** receives `outputs.artifact` containing the full session transcript — this is the complete trajectory of everything that happened under the hood, including tool calls, reasoning/thinking blocks, and internal processing steps. Think of it as the "behind the scenes" view of how the agent actually worked through the task.
+- **`session.start.outputs.chat_history`** is the user-facing conversation: the back-and-forth of user messages and assistant responses, basically what you'd see in the chat UI. It is filled in after session finalization so the session root is easy to review in HoneyHive.
+- **`session.end.outputs.chat_history`** carries the same final conversation next to the closing artifact.
+- **`session.end.outputs.artifact`** contains the full session transcript — this is the complete trajectory of everything that happened under the hood, including tool calls, reasoning/thinking blocks, and internal processing steps. Think of it as the "behind the scenes" view of how the agent actually worked through the task.
 
 This split lets you look at the same session from two angles: the conversation-level view for understanding what the user experienced, and the trajectory-level view for debugging agent behavior and understanding how it got there.
 
@@ -197,7 +200,7 @@ The repo includes a suite of server-side evaluators that run automatically on se
 
 **Client-side metrics** (computed by the daemon and attached to session events):
 
-`coding_agent.total_events`, `coding_agent.tool_count`, `coding_agent.model_count`, `coding_agent.unique_tools`, `coding_agent.bash_ratio`, `coding_agent.search_ratio`, `coding_agent.tool_model_ratio`, `coding_agent.permission_ratio`, `coding_agent.has_errors`, `coding_agent.subagent_balanced`
+`coding_agent.event_count`, `coding_agent.tool_count`, `coding_agent.model_count`, `coding_agent.unique_tools`, `coding_agent.bash_ratio`, `coding_agent.search_ratio`, `coding_agent.tool_model_ratio`, `coding_agent.permission_ratio`, `coding_agent.has_errors`, `coding_agent.subagent_balanced`
 
 #### Managing evaluators
 

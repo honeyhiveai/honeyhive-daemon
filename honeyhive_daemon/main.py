@@ -24,6 +24,7 @@ from .transcript import (
     TranscriptContext,
     get_context_for_latest_turn,
     get_context_for_tool_use,
+    get_skills_listing,
 )
 from .config import (
     DEFAULT_BASE_URL,
@@ -62,6 +63,7 @@ from .metrics import (
 from .state import (
     append_chat_history,
     append_spool_event,
+    claim_tool_usage_request_id,
     get_chat_history,
     buffer_pending_tool_event,
     get_expired_tool_events,
@@ -70,9 +72,11 @@ from .state import (
     load_session_index,
     log_message,
     mark_session_artifact_pushed,
+    claim_skills_listed_export,
     pop_pending_tool_event,
     read_spool_events,
     record_session_activity,
+    release_skills_listed_export,
     replace_spool_events,
 )
 
@@ -433,14 +437,35 @@ def ingest_claude_hook() -> None:
 
     transcript_path = event.get("metadata", {}).get("transcript.path")
     is_session_start = event["event_name"] == "session.start"
+    is_session_end = event["event_name"] == "session.end"
+
+    if is_session_end:
+        queued_event = dict(event)
+        queued_event["spool_reason"] = "queued session.end for daemon flush"
+        queued_event["_resolved_config"] = config.to_dict()
+        append_spool_event(queued_event)
+        record_session_activity(
+            str(event["session_id"]),
+            transcript_path=str(transcript_path) if transcript_path else None,
+            last_activity_ms=int(event["end_time"]),
+            ended=True,
+            session_end_event_id=str(event["event_id"]),
+            cwd=event_cwd,
+            session_name=session_name,
+        )
+        log_message(
+            "queued session.end for daemon flush "
+            f"session_id={event['session_id']} "
+            f"event_id={event['event_id']}"
+        )
+        return
+
     session_state = record_session_activity(
         str(event["session_id"]),
         transcript_path=str(transcript_path) if transcript_path else None,
         last_activity_ms=int(event["end_time"]),
-        ended=event["event_name"] == "session.end",
-        session_end_event_id=(
-            str(event["event_id"]) if event["event_name"] == "session.end" else None
-        ),
+        ended=False,
+        session_end_event_id=None,
         session_start_exported=True if is_session_start else None,
         cwd=event_cwd,
         session_name=session_name,
@@ -450,7 +475,12 @@ def ingest_claude_hook() -> None:
     # When the daemon starts mid-session, it misses the SessionStart hook.
     # Without a session.start event in HoneyHive, artifact updates fail
     # with 400 and all session data is lost. Create it now.
-    if not is_session_start and not session_state.get("session_start_exported"):
+    should_synthesize_session_start = (
+        not is_session_start
+        and hook_event_name != "InstructionsLoaded"
+        and not session_state.get("session_start_exported")
+    )
+    if should_synthesize_session_start:
         synthetic_session = {
             "event_id": str(event["session_id"]),  # session.start uses session_id as event_id
             "session_id": str(event["session_id"]),
@@ -458,7 +488,7 @@ def ingest_claude_hook() -> None:
             "event_name": "session.start",
             "start_time": int(event["start_time"]),
             "end_time": int(event["start_time"]),
-            "duration": 0,
+            "duration": 1,
             "inputs": {},
             "outputs": {},
             "metadata": {
@@ -503,6 +533,14 @@ def ingest_claude_hook() -> None:
                 f"session_id={event['session_id']}: {exc}"
             )
 
+    _maybe_export_skills_listed(
+        config,
+        session_id=str(event["session_id"]),
+        transcript_path=str(transcript_path) if transcript_path else None,
+        metadata_base=event.get("metadata", {}),
+        timestamp_ms=int(event["start_time"]),
+    )
+
     # Pre+post tool event linking
     hook_phase = event.pop("_hook_phase", None)
     hook_failure = event.pop("_hook_failure", False)
@@ -537,19 +575,26 @@ def ingest_claude_hook() -> None:
             elif event.get("event_type") == "model":
                 ctx = get_context_for_latest_turn(str(transcript_path))
             if ctx is not None and ctx.has_data():
-                _apply_transcript_context(event, ctx)
+                include_usage = True
+                if event.get("event_type") == "tool" and ctx.request_id:
+                    include_usage = claim_tool_usage_request_id(
+                        str(event["session_id"]), ctx.request_id
+                    )
+                _apply_transcript_context(event, ctx, include_usage=include_usage)
         except Exception:
             pass  # transcript enrichment is best-effort
 
-    # Accumulate chat history for turn events
+    # Accumulate chat history for turn events.
+    # inputs.chat_history includes the current turn so every turn is inspectable
+    # without reconstructing its own outputs client-side.
     turn_role = event.get("metadata", {}).get("turn.role")
     if turn_role and event.get("event_type") == "model":
         content = event.get("outputs", {}).get("content")
         if content is not None:
-            chat_history = append_chat_history(
-                str(event["session_id"]), turn_role, str(content)
+            session_id = str(event["session_id"])
+            event.setdefault("inputs", {})["chat_history"] = append_chat_history(
+                session_id, turn_role, str(content)
             )
-            event.setdefault("inputs", {})["chat_history"] = chat_history
 
     try:
         export_event(config, event)
@@ -623,8 +668,15 @@ def _merge_tool_events(
     """Merge a pre-phase and post-phase tool event into a single event."""
     merged = dict(post_event)
     merged["event_id"] = pre_event["event_id"]
-    merged["start_time"] = pre_event["start_time"]
-    merged["duration"] = int(post_event["end_time"]) - int(pre_event["start_time"])
+    wall_duration_ms = max(0, int(post_event["end_time"]) - int(pre_event["start_time"]))
+    reported_duration_ms = _tool_reported_duration_ms(post_event)
+    duration_ms = reported_duration_ms if reported_duration_ms is not None else wall_duration_ms
+    duration_ms = max(1, int(duration_ms))
+    merged["duration"] = duration_ms
+    merged["end_time"] = int(post_event["end_time"])
+    merged["start_time"] = max(
+        int(pre_event["start_time"]), int(merged["end_time"]) - duration_ms
+    )
 
     # Merge inputs from pre, outputs from post
     merged["inputs"] = dict(pre_event.get("inputs", {}))
@@ -636,6 +688,9 @@ def _merge_tool_events(
     metadata.update(post_event.get("metadata", {}))
     metadata["tool.phase"] = "complete"
     metadata["tool.status"] = "failure" if failure else "success"
+    metadata["tool.wall_duration_ms"] = wall_duration_ms
+    if reported_duration_ms is not None:
+        metadata["tool.reported_duration_ms"] = reported_duration_ms
     merged["metadata"] = metadata
 
     # Propagate error from failed tool executions
@@ -655,6 +710,18 @@ def _merge_tool_events(
     merged.pop("raw", None)
 
     return merged
+
+
+def _tool_reported_duration_ms(event: dict) -> Optional[int]:
+    """Return Claude's reported tool runtime from the post-hook payload."""
+    raw = event.get("raw") or {}
+    value = raw.get("duration_ms")
+    if value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _flush_expired_tool_events(config: DaemonConfig) -> None:
@@ -685,7 +752,81 @@ def _flush_expired_tool_events(config: DaemonConfig) -> None:
             log_message(f"spooled orphaned tool event: {exc}")
 
 
-def _apply_transcript_context(event: dict, ctx: TranscriptContext) -> None:
+def _maybe_export_skills_listed(
+    config: DaemonConfig,
+    *,
+    session_id: str,
+    transcript_path: Optional[str],
+    metadata_base: dict,
+    timestamp_ms: int,
+) -> None:
+    """Export chain.skills.listed once when the transcript skill_listing appears."""
+    if not transcript_path:
+        return
+
+    listing = get_skills_listing(transcript_path)
+    if listing is None:
+        return
+
+    if not claim_skills_listed_export(session_id):
+        return
+
+    names = listing["names"]
+    metadata = {
+        k: v
+        for k, v in metadata_base.items()
+        if k
+        in (
+            "agent.provider",
+            "agent.product",
+            "capture.source",
+            "raw.format",
+            "agent.session_id",
+            "cwd",
+            "repo.path",
+            "git.revision",
+            "transcript.path",
+        )
+    }
+    metadata["skills.count"] = listing["count"]
+
+    skills_event = {
+        "event_id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "parent_id": session_id,
+        "event_type": "chain",
+        "event_name": "chain.skills.listed",
+        "start_time": timestamp_ms,
+        "end_time": timestamp_ms,
+        "duration": 1,
+        "inputs": {},
+        "outputs": {
+            "names": names,
+            "count": listing["count"],
+        },
+        "metadata": metadata,
+    }
+
+    try:
+        export_event(config, skills_event)
+        log_message(
+            "exported skills listing "
+            f"session_id={session_id} "
+            f"count={listing['count']}"
+        )
+    except Exception as exc:
+        release_skills_listed_export(session_id)
+        log_message(
+            f"spooled skills listing session_id={session_id}: {exc}"
+        )
+        skills_event["spool_reason"] = str(exc)
+        skills_event["_resolved_config"] = config.to_dict()
+        append_spool_event(skills_event)
+
+
+def _apply_transcript_context(
+    event: dict, ctx: TranscriptContext, *, include_usage: bool = True
+) -> None:
     """Apply thinking, usage, and model metadata from transcript to an event."""
     if ctx.thinking:
         event.setdefault("inputs", {})["thinking"] = ctx.thinking
@@ -694,7 +835,7 @@ def _apply_transcript_context(event: dict, ctx: TranscriptContext) -> None:
         metadata["model"] = ctx.model
     if ctx.request_id:
         metadata["request_id"] = ctx.request_id
-    if ctx.usage:
+    if include_usage and ctx.usage:
         for key, value in ctx.usage.items():
             metadata[f"usage.{key}"] = value
         # Alias to HoneyHive standard field names
@@ -858,6 +999,7 @@ def _push_pending_session_artifacts(
             )
 
         reason = "session_end" if session.get("ended") else "idle_timeout"
+        chat_history = get_chat_history(session["session_id"])
         artifact_outputs = {
             "artifact": {
                 "type": "transcript",
@@ -867,9 +1009,10 @@ def _push_pending_session_artifacts(
                 "reason": reason,
             }
         }
+        if chat_history:
+            artifact_outputs["chat_history"] = chat_history
         session_start_id = str(session["event_id"])
         session_end_id = session.get("session_end_event_id")
-        chat_history = get_chat_history(session["session_id"])
         try:
             if chat_history:
                 update_event_outputs(
@@ -886,9 +1029,11 @@ def _push_pending_session_artifacts(
             session_metrics = _compute_session_metrics(transcript_content)
             if session_metrics:
                 try:
+                    token_metadata = _session_token_metadata(session_metrics)
                     update_event(
                         session_config,
                         event_id=session_start_id,
+                        metadata=token_metadata or None,
                         metrics=session_metrics,
                     )
                     log_message(
@@ -921,6 +1066,22 @@ def _push_pending_session_artifacts(
                     "giving up on session artifact after max retries "
                     f"session_id={session['session_id']}"
                 )
+
+
+def _session_token_metadata(metrics: dict) -> dict:
+    """Return standard token metadata aliases for session-level UI rollups."""
+    metadata: dict = {}
+    input_tokens = metrics.get("coding_agent.total_input_tokens")
+    output_tokens = metrics.get("coding_agent.total_output_tokens")
+    total_tokens = metrics.get("coding_agent.total_tokens")
+
+    if input_tokens is not None:
+        metadata["prompt_tokens"] = input_tokens
+    if output_tokens is not None:
+        metadata["completion_tokens"] = output_tokens
+    if total_tokens is not None:
+        metadata["total_tokens"] = total_tokens
+    return metadata
 
 
 def _settings_have_command(settings_path: Path) -> bool:

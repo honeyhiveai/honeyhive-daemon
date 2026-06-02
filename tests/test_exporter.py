@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from honeyhive_daemon.config import DaemonConfig
-from honeyhive_daemon.exporter import _build_event_payload, export_event
+from honeyhive_daemon.exporter import _build_event_payload, export_event, update_event
 
 
 def _session_end_event(**overrides: object) -> dict:
@@ -74,6 +74,12 @@ def test_export_event_logs_success_after_create(
         },
     )
 
+    assert any(
+        "export attempt" in line
+        and "session_id=sess-1" in line
+        and "event_id=end-1" in line
+        for line in log_lines
+    )
     assert any("exported claude event" in line and "session.end" in line for line in log_lines)
     assert any("session ended" in line and "sess-1" in line for line in log_lines)
 
@@ -91,3 +97,32 @@ def test_build_event_payload_zero_duration_when_timestamps_equal() -> None:
         _session_end_event(event_name="session.start", end_time=1000),
     )
     assert payload["event"]["duration"] == 0
+
+
+def test_update_event_accepts_metadata(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    captured = {}
+
+    class FakeEventsAPI:
+        def update(self, data) -> None:  # type: ignore[no-untyped-def]
+            captured["data"] = data
+
+    class FakeHoneyHive:
+        def __init__(self, api_key: str, base_url: str) -> None:
+            self.events = FakeEventsAPI()
+
+    monkeypatch.setattr("honeyhive_daemon.exporter.HoneyHive", FakeHoneyHive)
+
+    config = DaemonConfig(api_key="k", base_url="https://api.honeyhive.ai")
+    update_event(
+        config,
+        event_id="session-1",
+        metadata={"total_tokens": 168},
+        metrics={"coding_agent.total_tokens": 168},
+    )
+
+    data = captured["data"]
+    payload = data.model_dump() if hasattr(data, "model_dump") else data
+    assert payload["event_id"] == "session-1"
+    assert payload["metadata"] == {"total_tokens": 168}
+    assert payload["metrics"] == {"coding_agent.total_tokens": 168}

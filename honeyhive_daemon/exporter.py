@@ -26,6 +26,8 @@ def export_event(config: DaemonConfig, event: Dict[str, Any]) -> None:
     log_message(
         "export attempt "
         f"event_name={event['event_name']} "
+        f"session_id={event['session_id']} "
+        f"event_id={event['event_id']} "
         f"url={_get_events_endpoint(config.base_url)} "
         f"api_key_fingerprint={_key_fingerprint(config.api_key)}"
     )
@@ -66,6 +68,7 @@ def update_event(
     event_id: str,
     inputs: Optional[Dict[str, Any]] = None,
     outputs: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
     metrics: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Update an existing HoneyHive event with additional inputs, outputs, and/or metrics."""
@@ -80,6 +83,8 @@ def update_event(
         data["inputs"] = inputs
     if outputs is not None:
         data["outputs"] = outputs
+    if metadata is not None:
+        data["metadata"] = metadata
     if metrics is not None:
         data["metrics"] = metrics
 

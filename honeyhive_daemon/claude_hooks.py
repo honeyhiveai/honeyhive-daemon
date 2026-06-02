@@ -23,6 +23,7 @@ from .mappings import (
 
 _DAEMON_HOOK_ARGS = ("ingest", "claude-hook")
 _DAEMON_EXECUTABLE_NAMES = frozenset({"honeyhive-daemon", "honeyhive-daemon.exe"})
+_INSTRUCTIONS_MAX_BYTES = 65_536
 
 
 def _strip_executable_quotes(executable: str) -> str:
@@ -229,7 +230,44 @@ def normalize_claude_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]
         if hook_event_name == "PostToolUseFailure":
             event["_hook_failure"] = True
 
+    if hook_event_name == "InstructionsLoaded":
+        _enrich_instructions_loaded(event, payload)
+
     return event
+
+
+def _enrich_instructions_loaded(event: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    """Read instruction file content into outputs.
+
+    Claude Code's InstructionsLoaded hook is observability-only and does not
+    include file content — only path, memory_type, and load_reason. We read the
+    file at ingest time so HoneyHive exports are inspectable.
+    """
+    file_path = payload.get("file_path")
+    if not file_path:
+        return
+
+    path = Path(str(file_path))
+    outputs: Dict[str, Any] = dict(event.get("outputs") or {})
+    outputs["path"] = str(path)
+    outputs["basename"] = path.name
+
+    if path.is_file():
+        try:
+            raw = path.read_bytes()
+            if len(raw) > _INSTRUCTIONS_MAX_BYTES:
+                text = raw[:_INSTRUCTIONS_MAX_BYTES].decode("utf-8", errors="replace")
+                outputs["content"] = text + "\n\n[... truncated ...]"
+                outputs["truncated"] = True
+            else:
+                outputs["content"] = raw.decode("utf-8", errors="replace")
+                outputs["truncated"] = False
+        except OSError:
+            outputs["read_error"] = "could not read file"
+    else:
+        outputs["read_error"] = "file not found"
+
+    event["outputs"] = outputs
 
 
 # Cache for session names keyed by transcript path.

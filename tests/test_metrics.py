@@ -19,6 +19,7 @@ def _claude_code_transcript() -> list[dict]:
 
 def test_compute_session_metrics_counts_assistant_turns() -> None:
     metrics = compute_session_metrics(_claude_code_transcript())
+    assert metrics["coding_agent.event_count"] == 6.0
     assert metrics["coding_agent.model_count"] >= 2.0
 
 
@@ -51,6 +52,50 @@ def test_compute_session_metrics_aggregates_token_usage() -> None:
     assert metrics["coding_agent.total_tokens"] == 370.0
 
 
+def test_compute_session_metrics_reads_usage_from_message() -> None:
+    """Claude Code nests usage under message, not at the record top level."""
+    metrics = compute_session_metrics(
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": "hi",
+                    "usage": {"input_tokens": 100, "output_tokens": 20},
+                },
+                "requestId": "req-1",
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "usage": {"input_tokens": 200, "output_tokens": 50},
+                },
+                "requestId": "req-2",
+            },
+        ]
+    )
+    assert metrics["coding_agent.total_tokens"] == 370.0
+
+
+def test_compute_session_metrics_dedupes_streaming_chunks_by_request_id() -> None:
+    chunk = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [],
+            "usage": {"input_tokens": 2739, "output_tokens": 238},
+            "stop_reason": "tool_use",
+        },
+        "requestId": "req-same",
+    }
+    metrics = compute_session_metrics([chunk, dict(chunk), dict(chunk)])
+    assert metrics["coding_agent.total_input_tokens"] == 2739.0
+    assert metrics["coding_agent.total_output_tokens"] == 238.0
+    assert metrics["coding_agent.total_tokens"] == 2977.0
+
+
 def test_compute_session_metrics_aggregates_cache_token_fields() -> None:
     metrics = compute_session_metrics(
         [
@@ -68,3 +113,70 @@ def test_compute_session_metrics_aggregates_cache_token_fields() -> None:
     )
     assert metrics["coding_agent.total_cache_read_tokens"] == 50.0
     assert metrics["coding_agent.total_cache_creation_tokens"] == 10.0
+
+
+def test_compute_session_metrics_counts_nested_tool_use_blocks() -> None:
+    """Claude Code embeds tool_use blocks inside assistant messages."""
+    metrics = compute_session_metrics(
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "name": "Read", "id": "tool-1"},
+                        {"type": "tool_use", "name": "Bash", "id": "tool-2"},
+                    ],
+                },
+                "requestId": "req-tools",
+            },
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "tool-1", "is_error": False},
+                    ],
+                },
+            },
+        ]
+    )
+    assert metrics["coding_agent.tool_count"] == 2.0
+    assert metrics["coding_agent.unique_tools"] == 2.0
+    assert metrics["coding_agent.bash_ratio"] == 0.5
+
+
+def test_compute_session_metrics_smoke_like_transcript_shape() -> None:
+    """Representative Claude Code records without depending on local transcripts."""
+    records = [
+        {"type": "custom-title", "customTitle": "smoke-test"},
+        {"type": "user", "message": {"role": "user", "content": "read README"}},
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "I'll inspect it."},
+                    {"type": "tool_use", "id": "toolu_read", "name": "Read"},
+                    {"type": "tool_use", "id": "toolu_bash", "name": "Bash"},
+                ],
+                "usage": {"input_tokens": 2800, "output_tokens": 234},
+            },
+            "requestId": "req-smoke",
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_read", "is_error": False},
+                    {"type": "tool_result", "tool_use_id": "toolu_bash", "is_error": False},
+                ],
+            },
+        },
+    ]
+
+    metrics = compute_session_metrics(records)
+    assert metrics["coding_agent.tool_count"] == 2.0
+    assert metrics["coding_agent.bash_ratio"] == 0.5
+    assert metrics["coding_agent.total_tokens"] == 3034.0

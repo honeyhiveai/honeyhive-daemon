@@ -13,8 +13,8 @@ Schema::
       "enabled": true,
 
       // Session-level gates (glob on session name from transcript)
-      "session_name_include": ["waggle-*"],
-      "session_name_exclude": ["waggle-taste-*"],
+      "session_name_include": ["release-*"],
+      "session_name_exclude": ["release-dry-run-*"],
 
       // Event-type gates
       "exclude_event_types": ["tool", "model"],

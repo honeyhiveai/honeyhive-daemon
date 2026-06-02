@@ -204,8 +204,8 @@ def _claudemd_evaluator(slug: str, instructions: str) -> dict:
     return {
         "name": f"Instruction Adherence - {slug}",
         "type": "LLM",
-        "model_provider": "anthropic",
-        "model_name": "claude-3-5-haiku-20241022",
+        "model_provider": "openai",
+        "model_name": "gpt-5.4-mini",
         "criteria": prompt,
         "return_type": "float",
         "scale": 4,
