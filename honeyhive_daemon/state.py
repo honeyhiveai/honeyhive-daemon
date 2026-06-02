@@ -136,11 +136,10 @@ def _locked_session_index() -> Iterator[Dict[str, Dict[str, Any]]]:
     """Load the session index under an exclusive lock for read-modify-write."""
     ensure_state_layout()
     path = get_sessions_path()
-    if not path.exists():
-        path.write_text("{}\n", encoding="utf-8")
-    with path.open("r+", encoding="utf-8") as handle:
+    with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
+            handle.seek(0)
             raw = handle.read()
             try:
                 index = json.loads(raw) if raw.strip() else {}
