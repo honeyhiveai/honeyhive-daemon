@@ -5,9 +5,12 @@ description: Run a real Claude Code session through honeyhive-daemon, verify Hon
 
 # Test Claude Code → HoneyHive trace
 
-**Purpose:** exercise the real path (tmux daemon + `claude -p`), compare logs and API export to expectations, and **fix what breaks** — in `honeyhive-daemon`, hooks, or this skill. A green checklist is not the goal; surfacing and resolving gaps is.
+**Purpose:** exercise the real path (daemon + `claude -p`), compare logs and API export to expectations, and **fix what breaks** — in `honeyhive-daemon`, hooks, or this skill. A green checklist is not the goal; surfacing and resolving gaps is.
 
-Agent-only. No wrapper scripts. Daemon in **detached tmux**; Claude via **`claude -p`**.
+- **Human manual test:** daemon in a **foreground terminal** (second tab/window for `claude -p`). No tmux required.
+- **Agent automation:** detached **tmux** only (one-shot shells must not use `run &`).
+
+No wrapper scripts. Claude via **`claude -p`** (not `--bare`).
 
 ## Devin Secrets Needed
 
@@ -21,8 +24,8 @@ The API URL for production DP1 is `https://api.dp1.us.prod.honeyhive.ai`.
 ## Prerequisites
 
 - Claude Code CLI (`claude`) authenticated
-- `tmux`
-- `HH_API_KEY`, `HH_API_URL` (or `.env` to source)
+- `HH_API_KEY` (required). `HH_API_URL` only if not using the daemon default (`https://api.dp1.us.prod.honeyhive.ai`)
+- `tmux` — agents only (humans use two terminal tabs)
 - `honeyhive-daemon` + `honeyhive` in the **same** Python as the `honeyhive-daemon` on PATH
 - HoneyHive CLI (`honeyhive`) on PATH — [install guide](https://honeyhiveai.github.io/honeyhive-cli/); not a Python shim named `honeyhive`
 
@@ -37,12 +40,13 @@ file "$(which honeyhive-daemon)" "$(which honeyhive)"
 
 - **Hooks use PATH** — install daemon into the interpreter that owns `honeyhive-daemon`.
 - **Daemon before `claude -p`** — otherwise `session_name=(unknown)`.
-- **Never `run &` in a one-shot shell** — detached tmux only.
+- **Humans:** leave `honeyhive-daemon run` in the foreground in tab 1; run `claude -p` in tab 2. Stop with Ctrl-C in tab 1 or `honeyhive-daemon stop` from tab 2.
+- **Agents:** never `run &` in a one-shot shell — use detached tmux (§3b).
 - **No `--bare`** — skips hooks.
 - **Let `claude -p` finish** — do not Ctrl+C; abrupt exit drops `session.end`.
 - **`SessionEnd hook ... Hook cancelled` on stderr** — common in print mode; wait `sleep 12` and trust `daemon.log` + API, not stderr alone.
 - **Artifact flush is async** — daemon loop ~5s; wait 12s before declaring failure.
-- **Re-run `run` in tmux after upgrading** — refreshes absolute hook path in `~/.claude/settings.json`.
+- **Re-run `run` after upgrading** — refreshes absolute hook path in `~/.claude/settings.json`.
 - **CLI stderr corrupts JSON** — when piping `honeyhive events search` to a file, use `2>/dev/null` to prevent the `HH_API_URL` deprecation warning from mixing into JSON output.
 - **Spool reason race** — daemon background flush loop may modify spool entries between `status` calls. Capture `status` output in a single invocation.
 
@@ -61,9 +65,24 @@ pip install -e .    # or: uv pip install -e .
 set -a && source /path/to/.env && set +a
 ```
 
-No `init` step.
+Optional: `honeyhive-daemon init` once per repo (not required if you only use env vars).
 
-### 3. Start daemon (detached tmux)
+### 3a. Start daemon (human — foreground)
+
+**Terminal 1** — leave this running:
+
+```bash
+cd /path/to/workdir
+set -a && source /path/to/.env && set +a
+honeyhive-daemon run
+# Non-default plane only: honeyhive-daemon run --url "$HH_API_URL"
+```
+
+Optional isolated state: `export HH_DAEMON_HOME=/tmp/hh-smoke-$(whoami) && mkdir -p "$HH_DAEMON_HOME"` before `run`.
+
+**Terminal 2** — steps 4–7 below. When done, stop the daemon: Ctrl-C in terminal 1, or `honeyhive-daemon stop` from terminal 2.
+
+### 3b. Start daemon (agent — detached tmux)
 
 ```bash
 WORKDIR=/path/to/workdir
@@ -71,25 +90,36 @@ tmux kill-session -t honeyhive 2>/dev/null || true
 tmux new-session -d -s honeyhive bash -lc "
   set -a && source /path/to/.env && set +a
   cd \"$WORKDIR\"
-  exec honeyhive-daemon run --url \"\$HH_API_URL\"
+  exec honeyhive-daemon run
+  # Non-default plane: exec honeyhive-daemon run --url \"\$HH_API_URL\"
 "
 sleep 2
 honeyhive-daemon status
 honeyhive-daemon doctor
 ```
 
-Optional: `HH_DAEMON_HOME` in the tmux block for isolated state. This is recommended for testing — it prevents stale state from prior runs from interfering.
+Optional: `HH_DAEMON_HOME` in the tmux block for isolated state.
 
 Cleanup: `honeyhive-daemon stop` or `tmux kill-session -t honeyhive`.
 
 ### 4. Run Claude (print mode)
 
+Use a prompt that forces **Read** and **Bash** so pre/post tool hooks export `tool.*` events (not just turns).
+
 ```bash
 cd "$WORKDIR"
-claude -p "Reply with exactly: honeyhive smoke ok"
+claude -p "$(cat <<'PROMPT'
+Telemetry smoke test. Do these steps in order, then stop:
+
+1. Read README.md in the current directory (first 10 lines is enough).
+2. Run a Bash command to print the current UTC time, e.g. date -u +"%Y-%m-%dT%H:%M:%SZ".
+3. In your final message, include: the first markdown heading from README, the date output, and this exact line on its own:
+   honeyhive smoke ok
+PROMPT
+)"
 ```
 
-Tool-free prompt avoids permission blocks. Add `--allowed-tools` or sandbox flags only if you intentionally test tools.
+If Claude blocks tool use, approve Read/Bash when prompted, or re-run with your usual non-interactive flags (e.g. permission-skipping) — the smoke test is only meaningful when at least one `tool.Read` and one `tool.Bash` (or equivalent) appear in the export.
 
 ### 5. Flush and capture session id
 
@@ -114,7 +144,11 @@ honeyhive-daemon status
 grep "$SESSION" "$LOG" | grep -E 'exported|artifact|session\.end|spooled|fail'
 ```
 
-Expect: `exported claude event`; `session ended session_id=...`; `updated session artifact` with `session_end`; no `spooled claude event` for `$SESSION`.
+Expect: `exported claude event` for `turn.*` and `tool.*` (e.g. `tool.Read`, `tool.Bash`); `session ended session_id=...` (logged in exporter immediately after API create — may still be missing if the hook process is killed mid-flight, but `export attempt` + API `session.end` is enough); `updated session artifact` with `session_end`; no `spooled claude event` for `$SESSION`.
+
+```bash
+grep "$SESSION" "$LOG" | grep 'exported claude event' | grep -E 'tool\.(Read|Bash)|turn\.'
+```
 
 ### 7. Fetch events (HoneyHive CLI)
 
@@ -131,9 +165,10 @@ python3 -c "
 import json
 d=json.load(open('session_export.json'))
 events = sorted(d.get('events',[]), key=lambda x: x.get('start_time',0))
+tools = [e for e in events if str(e.get('event_name','')).startswith('tool.')]
 for e in events:
     print(e.get('event_name'), e.get('event_type'), f'duration={e.get(\"duration\")}')
-print('count:', len(events))
+print('count:', len(events), 'tool_events:', len(tools))
 "
 ```
 
@@ -162,7 +197,8 @@ Record fixes: commit on a branch, or short note in the task (issue id + session 
 ## Pass checklist
 
 - [ ] Spool empty (`status` + `spool/events.jsonl`)
-- [ ] `session.start`, `turn.user`, `turn.agent` (and `tool.*` if testing tools)
+- [ ] `session.start`, `turn.user`, `turn.agent`
+- [ ] At least one `tool.*` event (e.g. `tool.Read`, `tool.Bash`) from the smoke prompt
 - [ ] `session.end` in CLI export
 - [ ] "session ended session_id=..." log line in daemon.log
 - [ ] `coding_agent.model_count` ≥ 1 on session.start metrics
@@ -176,9 +212,10 @@ If anything fails, **do not stop at FAIL** — follow §8 and land a fix or a fi
 
 | Symptom | Likely cause | What to do |
 |--------|----------------|------------|
-| `No module named 'honeyhive'` in hook | Wrong `honeyhive-daemon` on PATH | `pip install -e .`; restart tmux `run` |
+| `No module named 'honeyhive'` in hook | Wrong `honeyhive-daemon` on PATH | `pip install -e .`; restart `run` |
 | Events stuck in spool | SDK/API errors | Fix exporter; grep `daemon.log` |
-| `session.end` missing | Daemon died, killed `claude`, or insufficient wait | tmux `run`; `claude -p`; `sleep 12`; check artifact line |
+| `session.end` missing | Daemon not running, killed `claude`, or insufficient wait | `run` in foreground (or tmux); `claude -p`; `sleep 12`; check artifact line |
+| `session ended` log missing but API has `session.end` | SessionEnd hook cancelled after `export attempt` | PASS if API + artifact OK; re-run with latest daemon (logs success inside exporter) |
 | stderr `SessionEnd hook ... cancelled` | Print-mode race | Wait 12s; verify artifact + API anyway |
 | `failed session artifact update` for old uuid | Stale state | Use SESSION from latest `session_end` artifact line |
 | CLI URL flag error | Deprecated flag | `--data-plane-url "$HH_API_URL"` |
@@ -187,3 +224,4 @@ If anything fails, **do not stop at FAIL** — follow §8 and land a fix or a fi
 | UI 0 total tokens | Missing rollup fields | Inspect event metadata; fix daemon or document backend gap |
 | JSON parse error on CLI output | stderr deprecation warning mixed into redirected stdout | Use `2>/dev/null` when redirecting CLI output to file |
 | Spool reason changes between status calls | Daemon flush loop modifies spool in background | Capture status in single call; race is in test harness, not code |
+| No `tool.*` in export | Prompt too short or tools denied | Use §4 prompt; approve Read/Bash; check `daemon.log` for `tool.` exports |

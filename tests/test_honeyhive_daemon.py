@@ -508,11 +508,20 @@ def test_ingest_session_end_logs_session_id(
 
     monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
     log_messages: list[str] = []
+
+    class FakeEventsAPI:
+        def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+    class FakeHoneyHive:
+        def __init__(self, api_key: str, base_url: str) -> None:
+            self.events = FakeEventsAPI()
+
+    monkeypatch.setattr("honeyhive_daemon.exporter.HoneyHive", FakeHoneyHive)
     monkeypatch.setattr(
-        "honeyhive_daemon.main.log_message",
+        "honeyhive_daemon.exporter.log_message",
         lambda message: log_messages.append(message),
     )
-    monkeypatch.setattr("honeyhive_daemon.main.export_event", lambda *a, **kw: None)
     monkeypatch.setattr(
         "honeyhive_daemon.main.resolve_config",
         lambda **kw: kw.get("cli_defaults"),

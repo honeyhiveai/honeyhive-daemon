@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from honeyhive_daemon.config import DaemonConfig
-from honeyhive_daemon.exporter import _build_event_payload
+from honeyhive_daemon.exporter import _build_event_payload, export_event
 
 
 def _session_end_event(**overrides: object) -> dict:
@@ -36,6 +36,46 @@ def test_build_event_payload_preserves_explicit_duration() -> None:
         _session_end_event(event_name="tool.bash", duration=3000),
     )
     assert payload["event"]["duration"] == 3000
+
+
+def test_export_event_logs_success_after_create(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    log_lines: list[str] = []
+
+    class FakeEventsAPI:
+        def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+    class FakeHoneyHive:
+        def __init__(self, api_key: str, base_url: str) -> None:
+            self.events = FakeEventsAPI()
+
+    monkeypatch.setattr("honeyhive_daemon.exporter.HoneyHive", FakeHoneyHive)
+    monkeypatch.setattr(
+        "honeyhive_daemon.exporter.log_message",
+        lambda msg: log_lines.append(msg),
+    )
+
+    config = DaemonConfig(api_key="k", base_url="https://api.honeyhive.ai")
+    export_event(
+        config,
+        {
+            "event_id": "end-1",
+            "session_id": "sess-1",
+            "event_type": "chain",
+            "event_name": "session.end",
+            "start_time": 1,
+            "end_time": 2,
+            "inputs": {},
+            "outputs": {},
+            "metadata": {},
+        },
+    )
+
+    assert any("exported claude event" in line and "session.end" in line for line in log_lines)
+    assert any("session ended" in line and "sess-1" in line for line in log_lines)
 
 
 def test_build_event_payload_omits_legacy_project_field() -> None:

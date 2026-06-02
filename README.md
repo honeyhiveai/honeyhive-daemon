@@ -26,8 +26,6 @@ A local daemon that captures Claude Code activity via hooks and exports structur
 
 ### Quickstart
 
-**Per-project setup (recommended):**
-
 ```bash
 pip install honeyhive-daemon
 
@@ -36,21 +34,12 @@ honeyhive-daemon init
 # Creates .honeyhive/config.json and .honeyhive/config.local.json
 
 export HH_API_KEY=your-key
-export HH_API_URL=https://api.dp1.us.prod.honeyhive.ai  # omit if using the default endpoint
+# export HH_API_URL=...   # only if not using the default endpoint (see `run` options)
 
 honeyhive-daemon run
 ```
 
-Project is resolved from your API key on HoneyHive — you do not need to pass `--project` on `init` or `run`.
-
-**Single-project (legacy):**
-
-```bash
-export HH_API_KEY=your-key
-export HH_API_URL=https://api.dp1.us.prod.honeyhive.ai
-
-honeyhive-daemon run --key $HH_API_KEY
-```
+Project scope is resolved from your API key — no project name on `init` or `run`.
 
 The daemon stores local state in `~/.honeyhive/daemon/` and installs Claude hooks in `~/.claude/settings.json`.
 
@@ -66,11 +55,8 @@ The daemon stores local state in `~/.honeyhive/daemon/` and installs Claude hook
 If you kill the daemon immediately after Claude exits, pending artifacts and retries may be lost. Give it ~10s after your last Claude session ends.
 
 ```bash
-# Recommended: run in a dedicated terminal or tmux session
+# Run in a dedicated terminal while you use Claude Code
 honeyhive-daemon run
-
-# Or in tmux:
-tmux new-session -d -s honeyhive 'honeyhive-daemon run'
 ```
 
 To stop it:
@@ -136,7 +122,7 @@ All daemon state lives under `~/.honeyhive/daemon/` (override with `HH_DAEMON_HO
 | Flag | Env var | Description |
 |------|---------|-------------|
 | `--key` | `HH_API_KEY` | HoneyHive API key (required). |
-| `--url` | `HH_API_URL` | Data plane URL (default: `https://api.dp1.us.prod.honeyhive.ai`). |
+| `--url` | `HH_API_URL` | Data plane URL (default: `https://api.dp1.us.prod.honeyhive.ai`; omit env var to use default). |
 | `--repo PATH` | | Git repo to attach commit events to. |
 | `--ci` | | Enable CI mode. |
 
@@ -185,8 +171,6 @@ If events aren't showing up in HoneyHive, work through these checks in order:
 4. **Hooks installed?** Run `honeyhive-daemon doctor` or inspect `~/.claude/settings.json` for the hook command.
 5. **Spool buildup?** `wc -l ~/.honeyhive/daemon/spool/events.jsonl` — if events are piling up, check the `spool_reason` field for error details.
 6. **PATH issues.** Ensure `honeyhive-daemon` is on PATH in the shell context Claude Code uses (`which honeyhive-daemon`). Virtualenv installations may not be visible to hooks.
-
-Agent smoke-test workflow: [`.agents/skills/test-claude-honeyhive-trace/SKILL.md`](.agents/skills/test-claude-honeyhive-trace/SKILL.md).
 
 ### Evaluators
 

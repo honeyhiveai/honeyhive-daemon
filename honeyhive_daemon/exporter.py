@@ -31,6 +31,17 @@ def export_event(config: DaemonConfig, event: Dict[str, Any]) -> None:
     )
     client = HoneyHive(api_key=config.api_key, base_url=config.base_url)
     client.events.create_event(PostEventRequest(event=payload["event"]))
+    log_message(
+        "exported claude event "
+        f"event_name={event['event_name']} "
+        f"session_id={event['session_id']}"
+    )
+    if event.get("event_name") == "session.end":
+        log_message(
+            "session ended "
+            f"session_id={event['session_id']} "
+            f"event_id={event['event_id']}"
+        )
 
 
 def export_events(config: DaemonConfig, events: Iterable[Dict[str, Any]]) -> None:

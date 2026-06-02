@@ -553,17 +553,8 @@ def ingest_claude_hook() -> None:
 
     try:
         export_event(config, event)
-        log_message(
-            "exported claude event "
-            f"event_name={event['event_name']} "
-            f"session_id={event['session_id']}"
-        )
-        if event["event_name"] == "session.end":
-            log_message(
-                "session ended "
-                f"session_id={event['session_id']} "
-                f"event_id={event['event_id']}"
-            )
+        # Success logs live in exporter.export_event (right after create_event)
+        # so SessionEnd hooks killed on exit still leave an audit trail.
         # Artifact push is handled by the daemon's background loop
         # (every 5s) rather than inline here, to avoid hook timeouts.
     except Exception as exc:  # pragma: no cover
