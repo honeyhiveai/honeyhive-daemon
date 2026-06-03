@@ -14,13 +14,13 @@ No wrapper scripts. Use `claude -p` (not `--bare`).
 
 ## Setup
 
-`**.env` only** at repo root (gitignored — `test -f .env`)
+**`.env` only** at repo root (gitignored — `test -f .env`)
 
 
 | Variable            | Purpose                                                  |
 | ------------------- | -------------------------------------------------------- |
 | `HH_API_KEY`        | DP1 export                                               |
-| `HH_API_URL`        | Optional; default `https://api.dp1.us.prod.honeyhive.ai` |                                                       |
+| `HH_API_URL`        | Optional; default `https://api.dp1.us.prod.honeyhive.ai` |
 | `ANTHROPIC_API_KEY` | Only if `claude auth status` is not logged in            |
 
 
