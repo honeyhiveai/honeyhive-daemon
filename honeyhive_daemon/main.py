@@ -15,6 +15,7 @@ from typing import Optional
 import click
 
 from .claude_hooks import (
+    _is_daemon_hook_command,
     get_hook_command,
     install_claude_hooks,
     normalize_claude_payload,
@@ -54,110 +55,31 @@ from .git_hooks import (
     get_commit_link_payload,
     install_post_commit_hook,
 )
+from .metrics import (
+    compute_session_metrics as _compute_session_metrics,
+    read_transcript_jsonl as _read_transcript_jsonl,
+)
 from .state import (
     append_chat_history,
     append_spool_event,
+    claim_tool_usage_request_id,
+    drain_spool_events,
     get_chat_history,
+    split_session_start_chat_history,
     buffer_pending_tool_event,
     get_expired_tool_events,
     get_sessions_needing_artifact,
+    increment_session_artifact_retry,
     log_message,
     mark_session_artifact_pushed,
     pop_pending_tool_event,
     read_spool_events,
     record_session_activity,
-    replace_spool_events,
 )
 
 
 SESSION_IDLE_THRESHOLD_MS = 24 * 60 * 60 * 1000
-
-
-def _compute_session_metrics(transcript_content: list) -> dict:
-    """Compute client-side metrics from a session transcript.
-
-    These are attached to the session event via PUT /events so they're
-    available for dashboards and evaluator filters without needing
-    server-side evaluators to re-parse the transcript.
-    """
-    tool_count = 0
-    model_count = 0
-    chain_count = 0
-    bash_count = 0
-    search_count = 0
-    permission_count = 0
-    subagent_starts = 0
-    subagent_stops = 0
-    has_errors = False
-    tool_categories: dict[str, int] = {}
-
-    for record in transcript_content:
-        if not isinstance(record, dict):
-            continue
-
-        # Detect event type from transcript record
-        rtype = record.get("type", "")
-        hook_event = record.get("hook_event_name", "")
-
-        # Tool use records
-        if rtype in ("tool_use", "tool_result"):
-            tool_count += 1
-            tool_name = (record.get("tool_name") or record.get("name") or "").lower()
-            if tool_name in ("bash",):
-                bash_count += 1
-                tool_categories["bash"] = tool_categories.get("bash", 0) + 1
-            elif tool_name in ("read", "file_read"):
-                tool_categories["file_read"] = tool_categories.get("file_read", 0) + 1
-            elif tool_name in ("write", "file_write", "file_create"):
-                tool_categories["file_write"] = tool_categories.get("file_write", 0) + 1
-            elif tool_name in ("edit", "file_edit"):
-                tool_categories["file_edit"] = tool_categories.get("file_edit", 0) + 1
-            elif tool_name in ("glob", "grep", "file_search"):
-                search_count += 1
-                tool_categories["file_search"] = tool_categories.get("file_search", 0) + 1
-            elif tool_name in ("agent",):
-                tool_categories["agent"] = tool_categories.get("agent", 0) + 1
-            elif tool_name.startswith("mcp__"):
-                tool_categories["mcp"] = tool_categories.get("mcp", 0) + 1
-            else:
-                tool_categories["other"] = tool_categories.get("other", 0) + 1
-
-            if rtype == "tool_result" and record.get("is_error"):
-                has_errors = True
-
-        elif rtype in ("text", "thinking"):
-            model_count += 1
-
-        # Notification records
-        if record.get("notification_type") == "permission_prompt":
-            permission_count += 1
-
-        # Subagent tracking
-        if hook_event == "SubagentStart":
-            subagent_starts += 1
-        elif hook_event == "SubagentStop":
-            subagent_stops += 1
-
-    total = tool_count + model_count + chain_count
-    metrics: dict[str, object] = {
-        "coding_agent.total_events": float(len(transcript_content)),
-        "coding_agent.tool_count": float(tool_count),
-        "coding_agent.model_count": float(model_count),
-        "coding_agent.unique_tools": float(len(tool_categories)),
-    }
-    if tool_count > 0:
-        metrics["coding_agent.bash_ratio"] = round(bash_count / tool_count, 3)
-        metrics["coding_agent.search_ratio"] = round(search_count / tool_count, 3)
-    if model_count > 0:
-        metrics["coding_agent.tool_model_ratio"] = round(tool_count / model_count, 2)
-    if total > 0:
-        metrics["coding_agent.permission_ratio"] = round(permission_count / total, 3)
-    metrics["coding_agent.has_errors"] = has_errors
-    metrics["coding_agent.subagent_balanced"] = (
-        subagent_starts == 0 or subagent_starts == subagent_stops
-    )
-
-    return metrics
+ARTIFACT_MAX_RETRIES = 3
 
 
 @click.group()
@@ -183,12 +105,6 @@ def cli() -> None:
     help="HoneyHive base URL or OTLP traces endpoint.",
 )
 @click.option(
-    "--project",
-    envvar="HH_PROJECT",
-    default=None,
-    help="HoneyHive project override (deprecated — use 'honeyhive-daemon init').",
-)
-@click.option(
     "--repo",
     type=click.Path(file_okay=False, path_type=Path),
     help="Repo to attach git commit events to.",
@@ -199,7 +115,6 @@ def run(
     ctx: click.Context,
     api_key: Optional[str],
     base_url: str,
-    project: Optional[str],
     repo: Optional[Path],
     ci: bool,
 ) -> None:
@@ -214,21 +129,11 @@ def run(
     key_from_cli = (
         ctx.get_parameter_source("api_key") == click.core.ParameterSource.COMMANDLINE
     )
-    project_from_cli = (
-        ctx.get_parameter_source("project") == click.core.ParameterSource.COMMANDLINE
-    )
-
     if key_from_cli:
         click.echo(
             "Warning: --key is deprecated. "
             "Use 'honeyhive-daemon init' to set up per-project config."
         )
-    if project_from_cli:
-        click.echo(
-            "Warning: --project is deprecated. "
-            "Use 'honeyhive-daemon init' to set up per-project config."
-        )
-
     # --- Migrate CLI-provided key to user-level config --------------------
     if api_key and key_from_cli:
         user_data: dict = {"api_key_env": "HH_API_KEY"}
@@ -261,8 +166,6 @@ def run(
         legacy = load_config()
         if legacy and legacy.api_key:
             api_key = legacy.api_key
-            if not project:
-                project = legacy.project
 
     if not api_key:
         click.echo(
@@ -274,22 +177,9 @@ def run(
         )
         raise SystemExit(1)
 
-    # --- Fallback chain for project ---------------------------------------
-    if not project:
-        user_cfg = load_user_config()
-        project = user_cfg.get("project")
-
-    if not project:
-        legacy = load_config()
-        if legacy and legacy.project:
-            project = legacy.project
-
-    resolved_project = project or _derive_project_name(repo_root)
-
     config = DaemonConfig(
         api_key=api_key,
         base_url=base_url,
-        project=resolved_project,
         repo_path=str(repo_root) if repo_root else None,
         ci=ci,
     )
@@ -307,7 +197,6 @@ def run(
 
     log_message(
         "daemon started "
-        f"project={resolved_project} "
         f"repo={repo_root or '-'} "
         f"ci={ci}"
     )
@@ -316,7 +205,6 @@ def run(
     click.echo(f"Daemon home: {get_daemon_home()}")
     click.echo(f"Filters: {filters_path}")
     click.echo(f"Claude settings: {settings_path}")
-    click.echo(f"Project: {resolved_project}")
     if repo_root is not None:
         click.echo(f"Repo: {repo_root}")
     click.echo(f"Claude hooks {'updated' if hooks_changed else 'already installed'}")
@@ -362,9 +250,9 @@ def run(
 
 
 @cli.command()
-@click.option("--project", "-p", required=True, help="HoneyHive project name")
 @click.option("--api-key-env", default="HH_API_KEY", help="Env var holding the API key")
-def init(project: str, api_key_env: str) -> None:
+@click.option("--url", default=None, help="HoneyHive API base URL (for self-hosted / non-default endpoints)")
+def init(api_key_env: str, url: str | None) -> None:
     """Initialize .honeyhive/ config in the current directory."""
     cwd = Path.cwd()
     hh_dir = cwd / ".honeyhive"
@@ -374,17 +262,16 @@ def init(project: str, api_key_env: str) -> None:
 
     hh_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write project config
-    project_config_path = hh_dir / "config.json"
-    project_config_path.write_text(
-        json.dumps({"project": project}, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    # Marker file (committed); secrets live in config.local.json
+    (hh_dir / "config.json").write_text("{}\n", encoding="utf-8")
 
     # Write local config (not committed)
+    local_config: dict[str, str] = {"api_key_env": api_key_env}
+    if url:
+        local_config["base_url"] = url
     local_config_path = hh_dir / "config.local.json"
     local_config_path.write_text(
-        json.dumps({"api_key_env": api_key_env}, indent=2) + "\n",
+        json.dumps(local_config, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -406,7 +293,7 @@ def init(project: str, api_key_env: str) -> None:
         gitignore_path.write_text(local_pattern + "\n", encoding="utf-8")
 
     click.echo(f"Created {hh_dir}/")
-    click.echo(f"  config.json        → project: {project}")
+    click.echo("  config.json        → (empty; project is resolved from your API key)")
     click.echo(f"  config.local.json  → api_key_env: {api_key_env}")
     click.echo(f"Updated {gitignore_path}")
 
@@ -415,12 +302,19 @@ def init(project: str, api_key_env: str) -> None:
 def status() -> None:
     """Show daemon status."""
     config = load_config()
-    pending = len(read_spool_events())
+    spool_events = read_spool_events()
+    pending = len(spool_events)
     click.echo(f"Daemon home: {get_daemon_home()}")
     click.echo(f"Configured: {'yes' if config else 'no'}")
     click.echo(f"Pending spool events: {pending}")
+    if pending > 0:
+        reasons: dict[str, int] = {}
+        for evt in spool_events:
+            reason = evt.get("spool_reason", "unknown")
+            reasons[reason] = reasons.get(reason, 0) + 1
+        for reason, count in reasons.items():
+            click.echo(f"  Spool reason ({count}x): {reason}")
     if config:
-        click.echo(f"Project: {config.project}")
         click.echo(f"Base URL: {config.base_url}")
         click.echo(f"Repo: {config.repo_path or '-'}")
 
@@ -540,14 +434,35 @@ def ingest_claude_hook() -> None:
 
     transcript_path = event.get("metadata", {}).get("transcript.path")
     is_session_start = event["event_name"] == "session.start"
+    is_session_end = event["event_name"] == "session.end"
+
+    if is_session_end:
+        queued_event = dict(event)
+        queued_event["spool_reason"] = "queued session.end for daemon flush"
+        queued_event["_resolved_config"] = config.to_dict()
+        append_spool_event(queued_event)
+        record_session_activity(
+            str(event["session_id"]),
+            transcript_path=str(transcript_path) if transcript_path else None,
+            last_activity_ms=int(event["end_time"]),
+            ended=True,
+            session_end_event_id=str(event["event_id"]),
+            cwd=event_cwd,
+            session_name=session_name,
+        )
+        log_message(
+            "queued session.end for daemon flush "
+            f"session_id={event['session_id']} "
+            f"event_id={event['event_id']}"
+        )
+        return
+
     session_state = record_session_activity(
         str(event["session_id"]),
         transcript_path=str(transcript_path) if transcript_path else None,
         last_activity_ms=int(event["end_time"]),
-        ended=event["event_name"] == "session.end",
-        session_end_event_id=(
-            str(event["event_id"]) if event["event_name"] == "session.end" else None
-        ),
+        ended=False,
+        session_end_event_id=None,
         session_start_exported=True if is_session_start else None,
         cwd=event_cwd,
         session_name=session_name,
@@ -557,7 +472,12 @@ def ingest_claude_hook() -> None:
     # When the daemon starts mid-session, it misses the SessionStart hook.
     # Without a session.start event in HoneyHive, artifact updates fail
     # with 400 and all session data is lost. Create it now.
-    if not is_session_start and not session_state.get("session_start_exported"):
+    should_synthesize_session_start = (
+        not is_session_start
+        and hook_event_name != "InstructionsLoaded"
+        and not session_state.get("session_start_exported")
+    )
+    if should_synthesize_session_start:
         synthetic_session = {
             "event_id": str(event["session_id"]),  # session.start uses session_id as event_id
             "session_id": str(event["session_id"]),
@@ -565,7 +485,7 @@ def ingest_claude_hook() -> None:
             "event_name": "session.start",
             "start_time": int(event["start_time"]),
             "end_time": int(event["start_time"]),
-            "duration": 0,
+            "duration": 1,
             "inputs": {},
             "outputs": {},
             "metadata": {
@@ -644,27 +564,30 @@ def ingest_claude_hook() -> None:
             elif event.get("event_type") == "model":
                 ctx = get_context_for_latest_turn(str(transcript_path))
             if ctx is not None and ctx.has_data():
-                _apply_transcript_context(event, ctx)
+                include_usage = True
+                if event.get("event_type") == "tool" and ctx.request_id:
+                    include_usage = claim_tool_usage_request_id(
+                        str(event["session_id"]), ctx.request_id
+                    )
+                _apply_transcript_context(event, ctx, include_usage=include_usage)
         except Exception:
             pass  # transcript enrichment is best-effort
 
-    # Accumulate chat history for turn events
+    # Accumulate chat history for turn events.
+    # inputs.chat_history is prior context only; outputs.content is this turn.
     turn_role = event.get("metadata", {}).get("turn.role")
-    if turn_role and event.get("event_type") == "model":
+    if turn_role:
         content = event.get("outputs", {}).get("content")
         if content is not None:
-            history_before = append_chat_history(
-                str(event["session_id"]), turn_role, str(content)
-            )
-            event.setdefault("inputs", {})["chat_history"] = history_before
+            session_id = str(event["session_id"])
+            prior = get_chat_history(session_id)
+            event.setdefault("inputs", {})["chat_history"] = prior
+            append_chat_history(session_id, turn_role, str(content))
 
     try:
         export_event(config, event)
-        log_message(
-            "exported claude event "
-            f"event_name={event['event_name']} "
-            f"session_id={event['session_id']}"
-        )
+        # Success logs live in exporter.export_event (right after create_event)
+        # so SessionEnd hooks killed on exit still leave an audit trail.
         # Artifact push is handled by the daemon's background loop
         # (every 5s) rather than inline here, to avoid hook timeouts.
     except Exception as exc:  # pragma: no cover
@@ -733,8 +656,15 @@ def _merge_tool_events(
     """Merge a pre-phase and post-phase tool event into a single event."""
     merged = dict(post_event)
     merged["event_id"] = pre_event["event_id"]
-    merged["start_time"] = pre_event["start_time"]
-    merged["duration"] = int(post_event["end_time"]) - int(pre_event["start_time"])
+    wall_duration_ms = max(0, int(post_event["end_time"]) - int(pre_event["start_time"]))
+    reported_duration_ms = _tool_reported_duration_ms(post_event)
+    duration_ms = reported_duration_ms if reported_duration_ms is not None else wall_duration_ms
+    duration_ms = max(1, int(duration_ms))
+    merged["duration"] = duration_ms
+    merged["end_time"] = int(post_event["end_time"])
+    merged["start_time"] = max(
+        int(pre_event["start_time"]), int(merged["end_time"]) - duration_ms
+    )
 
     # Merge inputs from pre, outputs from post
     merged["inputs"] = dict(pre_event.get("inputs", {}))
@@ -746,6 +676,9 @@ def _merge_tool_events(
     metadata.update(post_event.get("metadata", {}))
     metadata["tool.phase"] = "complete"
     metadata["tool.status"] = "failure" if failure else "success"
+    metadata["tool.wall_duration_ms"] = wall_duration_ms
+    if reported_duration_ms is not None:
+        metadata["tool.reported_duration_ms"] = reported_duration_ms
     merged["metadata"] = metadata
 
     # Propagate error from failed tool executions
@@ -765,6 +698,18 @@ def _merge_tool_events(
     merged.pop("raw", None)
 
     return merged
+
+
+def _tool_reported_duration_ms(event: dict) -> Optional[int]:
+    """Return Claude's reported tool runtime from the post-hook payload."""
+    raw = event.get("raw") or {}
+    value = raw.get("duration_ms")
+    if value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _flush_expired_tool_events(config: DaemonConfig) -> None:
@@ -795,7 +740,9 @@ def _flush_expired_tool_events(config: DaemonConfig) -> None:
             log_message(f"spooled orphaned tool event: {exc}")
 
 
-def _apply_transcript_context(event: dict, ctx: TranscriptContext) -> None:
+def _apply_transcript_context(
+    event: dict, ctx: TranscriptContext, *, include_usage: bool = True
+) -> None:
     """Apply thinking, usage, and model metadata from transcript to an event."""
     if ctx.thinking:
         event.setdefault("inputs", {})["thinking"] = ctx.thinking
@@ -804,7 +751,7 @@ def _apply_transcript_context(event: dict, ctx: TranscriptContext) -> None:
         metadata["model"] = ctx.model
     if ctx.request_id:
         metadata["request_id"] = ctx.request_id
-    if ctx.usage:
+    if include_usage and ctx.usage:
         for key, value in ctx.usage.items():
             metadata[f"usage.{key}"] = value
         # Alias to HoneyHive standard field names
@@ -815,7 +762,7 @@ def _apply_transcript_context(event: dict, ctx: TranscriptContext) -> None:
 
 
 def _flush_spool(config: DaemonConfig) -> None:
-    pending = read_spool_events()
+    pending = drain_spool_events()
     if not pending:
         return
     log_message(f"flushing spool event_count={len(pending)}")
@@ -832,9 +779,21 @@ def _flush_spool(config: DaemonConfig) -> None:
             if stamped:
                 event["_resolved_config"] = stamped
             failed.append(event)
-    replace_spool_events(failed)
+    for event in failed:
+        append_spool_event(event)
     flushed = len(pending) - len(failed)
     log_message(f"flush complete flushed={flushed} remaining={len(failed)}")
+
+
+def _resolve_session_config(
+    session: dict, cli_defaults: DaemonConfig
+) -> DaemonConfig:
+    """Resolve the hierarchical config for a tracked session."""
+    cwd = session.get("cwd")
+    name = session.get("session_name")
+    if cwd or name:
+        return resolve_config(cwd=cwd, session_name=name, cli_defaults=cli_defaults)
+    return cli_defaults
 
 
 def _push_pending_session_artifacts(
@@ -853,14 +812,9 @@ def _push_pending_session_artifacts(
         transcript_path = session.get("transcript_path")
         if not transcript_path:
             continue
-        # Resolve per-session config from stored cwd/session_name
-        session_cwd = session.get("cwd")
-        sess_name = session.get("session_name")
-        session_config = resolve_config(
-            cwd=session_cwd,
-            session_name=sess_name,
-            cli_defaults=config,
-        ) if session_cwd or sess_name else config
+
+        session_config = _resolve_session_config(session, config)
+
         transcript_content = _read_transcript_jsonl(transcript_path)
         if transcript_content is None:
             log_message(
@@ -884,6 +838,7 @@ def _push_pending_session_artifacts(
             )
 
         reason = "session_end" if session.get("ended") else "idle_timeout"
+        chat_history = get_chat_history(session["session_id"])
         artifact_outputs = {
             "artifact": {
                 "type": "transcript",
@@ -893,41 +848,33 @@ def _push_pending_session_artifacts(
                 "reason": reason,
             }
         }
-        # Session root (session.start) gets only chat_history
-        chat_history = get_chat_history(session["session_id"])
-        session_root_outputs = {}
-        if chat_history:
-            session_root_outputs["chat_history"] = chat_history
-
-        # Session end gets the full artifact transcript
-        target_event_ids = [str(session["event_id"])]
-        session_end_event_id = session.get("session_end_event_id")
-        if session_end_event_id and session_end_event_id not in target_event_ids:
-            target_event_ids.append(str(session_end_event_id))
+        session_start_id = str(session["event_id"])
+        session_end_id = session.get("session_end_event_id")
         try:
-            for event_id in target_event_ids:
-                if event_id == str(session["event_id"]):
-                    # session.start root event — only chat history
-                    if session_root_outputs:
-                        update_event_outputs(
-                            session_config,
-                            event_id=event_id,
-                            outputs=session_root_outputs,
-                        )
-                else:
-                    # session.end event — full artifact transcript
-                    update_event_outputs(
-                        session_config,
-                        event_id=event_id,
-                        outputs=artifact_outputs,
-                    )
-            # Compute and attach client-side metrics to the session root event
+            if chat_history:
+                session_inputs, session_outputs = split_session_start_chat_history(
+                    chat_history
+                )
+                update_event(
+                    session_config,
+                    event_id=session_start_id,
+                    inputs=session_inputs or None,
+                    outputs=session_outputs or None,
+                )
+            if session_end_id:
+                update_event_outputs(
+                    session_config,
+                    event_id=str(session_end_id),
+                    outputs=artifact_outputs,
+                )
             session_metrics = _compute_session_metrics(transcript_content)
             if session_metrics:
                 try:
+                    token_metadata = _session_token_metadata(session_metrics)
                     update_event(
                         session_config,
-                        event_id=str(session["event_id"]),
+                        event_id=session_start_id,
+                        metadata=token_metadata or None,
                         metrics=session_metrics,
                     )
                     log_message(
@@ -948,27 +895,34 @@ def _push_pending_session_artifacts(
                 f"reason={reason}"
             )
         except Exception as exc:  # pragma: no cover
+            retry_count = increment_session_artifact_retry(session["session_id"])
             log_message(
                 "failed session artifact update "
-                f"session_id={session['session_id']}: {exc}"
+                f"session_id={session['session_id']} "
+                f"retry={retry_count}/{ARTIFACT_MAX_RETRIES}: {exc}"
             )
+            if retry_count >= ARTIFACT_MAX_RETRIES:
+                mark_session_artifact_pushed(session["session_id"], _now_ms())
+                log_message(
+                    "giving up on session artifact after max retries "
+                    f"session_id={session['session_id']}"
+                )
 
 
-def _read_transcript_jsonl(transcript_path: str) -> Optional[list]:
-    """Read a JSONL transcript and return parsed JSON objects."""
-    path = Path(transcript_path)
-    if not path.exists() or not path.is_file():
-        return None
-    records: list = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return records if records else None
+def _session_token_metadata(metrics: dict) -> dict:
+    """Return standard token metadata aliases for session-level UI rollups."""
+    metadata: dict = {}
+    input_tokens = metrics.get("coding_agent.total_input_tokens")
+    output_tokens = metrics.get("coding_agent.total_output_tokens")
+    total_tokens = metrics.get("coding_agent.total_tokens")
+
+    if input_tokens is not None:
+        metadata["prompt_tokens"] = input_tokens
+    if output_tokens is not None:
+        metadata["completion_tokens"] = output_tokens
+    if total_tokens is not None:
+        metadata["total_tokens"] = total_tokens
+    return metadata
 
 
 def _settings_have_command(settings_path: Path) -> bool:
@@ -979,7 +933,6 @@ def _settings_have_command(settings_path: Path) -> bool:
     except json.JSONDecodeError:
         return False
     hooks = settings.get("hooks", {})
-    target = get_hook_command()
     for entries in hooks.values():
         if not isinstance(entries, list):
             continue
@@ -987,18 +940,11 @@ def _settings_have_command(settings_path: Path) -> bool:
             if not isinstance(entry, dict):
                 continue
             for hook in entry.get("hooks", []):
-                if hook.get("type") == "command" and hook.get("command") == target:
+                if hook.get("type") == "command" and _is_daemon_hook_command(
+                    str(hook.get("command", ""))
+                ):
                     return True
     return False
-
-
-def _derive_project_name(repo_root: Optional[Path]) -> str:
-    env_project = os.getenv("HH_PROJECT")
-    if env_project:
-        return env_project
-    if repo_root is not None:
-        return repo_root.name
-    return Path.cwd().name
 
 
 def _resolve_repo(repo: Optional[Path]) -> Optional[Path]:

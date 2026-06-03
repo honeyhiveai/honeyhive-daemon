@@ -17,7 +17,7 @@
 
 ### Bug Fixes
 
-- **fix: move repo-specific sentinel patterns out of built-in defaults** — `"already promoted"` was a Waggle-specific sentinel that had leaked into the built-in error-category defaults. Built-in defaults now only contain patterns that generalize across any Claude Code repo; repo-specific sentinels belong in the per-repo `.honeyhive/error-categories.json` `categories` section.
+- **fix: move repo-specific sentinel patterns out of built-in defaults** — `"already promoted"` was a repo-specific sentinel that had leaked into the built-in error-category defaults. Built-in defaults now only contain patterns that generalize across any Claude Code repo; repo-specific sentinels belong in the per-repo `.honeyhive/error-categories.json` `categories` section.
 
 ## 0.7.1 (2026-04-16)
 

@@ -11,13 +11,13 @@ from .state import log_message
 
 try:
     from honeyhive import HoneyHive
-    from honeyhive._generated.models import PostEventRequest
+    from honeyhive.models.models import PostEventRequest, UpdateEventRequest
 except ImportError:  # pragma: no cover - exercised in local repo usage
     sdk_src = Path(__file__).resolve().parents[2] / "python-sdk" / "src"
     if str(sdk_src) not in sys.path:
         sys.path.insert(0, str(sdk_src))
     from honeyhive import HoneyHive
-    from honeyhive._generated.models import PostEventRequest
+    from honeyhive.models.models import PostEventRequest, UpdateEventRequest
 
 
 def export_event(config: DaemonConfig, event: Dict[str, Any]) -> None:
@@ -26,11 +26,24 @@ def export_event(config: DaemonConfig, event: Dict[str, Any]) -> None:
     log_message(
         "export attempt "
         f"event_name={event['event_name']} "
+        f"session_id={event['session_id']} "
+        f"event_id={event['event_id']} "
         f"url={_get_events_endpoint(config.base_url)} "
         f"api_key_fingerprint={_key_fingerprint(config.api_key)}"
     )
     client = HoneyHive(api_key=config.api_key, base_url=config.base_url)
     client.events.create_event(PostEventRequest(event=payload["event"]))
+    log_message(
+        "exported claude event "
+        f"event_name={event['event_name']} "
+        f"session_id={event['session_id']}"
+    )
+    if event.get("event_name") == "session.end":
+        log_message(
+            "session ended "
+            f"session_id={event['session_id']} "
+            f"event_id={event['event_id']}"
+        )
 
 
 def export_events(config: DaemonConfig, events: Iterable[Dict[str, Any]]) -> None:
@@ -55,6 +68,7 @@ def update_event(
     event_id: str,
     inputs: Optional[Dict[str, Any]] = None,
     outputs: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
     metrics: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Update an existing HoneyHive event with additional inputs, outputs, and/or metrics."""
@@ -69,10 +83,13 @@ def update_event(
         data["inputs"] = inputs
     if outputs is not None:
         data["outputs"] = outputs
+    if metadata is not None:
+        data["metadata"] = metadata
     if metrics is not None:
         data["metrics"] = metrics
+
     client = HoneyHive(api_key=config.api_key, base_url=config.base_url)
-    client.events.update(data=data)
+    client.events.update(data=UpdateEventRequest(**data))
 
 
 def _get_events_endpoint(base_url: str) -> str:
@@ -104,6 +121,16 @@ def _load_session_config(session_name: Optional[str]) -> Dict[str, Any]:
         return {}
 
 
+def _compute_duration(event: Dict[str, Any]) -> int:
+    """Return event duration, falling back to end_time - start_time when zero."""
+    explicit = int(event.get("duration", 0))
+    if explicit:
+        return explicit
+    start = int(event["start_time"])
+    end = int(event.get("end_time", start))
+    return max(0, end - start)
+
+
 def _build_event_payload(
     config: DaemonConfig, event: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -129,7 +156,6 @@ def _build_event_payload(
     event_config.update(session_config)
 
     event_payload: Dict[str, Any] = {
-        "project": config.project,
         "event_id": str(event["event_id"]),
         "session_id": str(event["session_id"]),
         "event_type": str(event["event_type"]),
@@ -137,7 +163,7 @@ def _build_event_payload(
         "source": "claude-code",
         "start_time": int(event["start_time"]),
         "end_time": int(event.get("end_time", event["start_time"])),
-        "duration": int(event.get("duration", 0)),
+        "duration": _compute_duration(event),
         "inputs": inputs,
         "outputs": outputs,
         "metadata": metadata,

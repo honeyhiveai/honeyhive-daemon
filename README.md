@@ -18,7 +18,7 @@ A local daemon that captures Claude Code activity via hooks and exports structur
 - Installs Claude Code hooks automatically at the user level
 - Merges pre-hook and post-hook into single tool events with accurate duration
 - Uses real tool names for event names (e.g. `tool.Bash`, `tool.Edit`, `tool.Grep`)
-- Emits turn events (`turn.user`, `turn.agent`) as `model` type with `chat_history`
+- Emits turn events with `chat_history` (`turn.user` as `chain`, `turn.agent` as `model`)
 - Enriches tool events with thinking/reasoning context from the session transcript
 - Uploads session artifacts via the daemon's background loop (every 5s) to avoid hook timeouts
 - Optionally emits lightweight git `chain.commit_link` events on `post-commit`
@@ -26,31 +26,36 @@ A local daemon that captures Claude Code activity via hooks and exports structur
 
 ### Quickstart
 
-**Per-project setup (recommended):**
-
 ```bash
 pip install honeyhive-daemon
 
 # In your project repo
-honeyhive-daemon init --project my-project
+honeyhive-daemon init
 # Creates .honeyhive/config.json and .honeyhive/config.local.json
-# Edit .honeyhive/config.local.json to set your api_key_env
 
-HH_API_KEY=your-key honeyhive-daemon run
+export HH_API_KEY=your-key
+# export HH_API_URL=...   # only if not using the default endpoint (see `run` options)
+
+honeyhive-daemon run
 ```
 
-**Single-project (legacy):**
-
-```bash
-honeyhive-daemon run --key $HH_API_KEY --project my-project
-```
+Project scope is resolved from your API key — no project name on `init` or `run`.
 
 The daemon stores local state in `~/.honeyhive/daemon/` and installs Claude hooks in `~/.claude/settings.json`.
 
 ### Running in the background
 
+**Important:** The daemon must stay running while you use Claude Code _and_ for a few seconds afterward. The daemon's background loop (every 5s) handles:
+
+- Flushing spooled events that failed to export
+- Pushing session artifacts (transcript + chat history) after a session ends
+- Computing and attaching session metrics (model count, tool count, token usage)
+
+If you kill the daemon immediately after Claude exits, pending artifacts and retries may be lost. Give it ~10s after your last Claude session ends.
+
 ```bash
-honeyhive-daemon run --key $HH_API_KEY --url $HH_API_URL &
+# Run in a dedicated terminal while you use Claude Code
+honeyhive-daemon run
 ```
 
 To stop it:
@@ -59,7 +64,7 @@ To stop it:
 honeyhive-daemon stop
 ```
 
-`stop` sends SIGTERM to the running daemon via its PID file (`~/.honeyhive/daemon/daemon.pid`). Only one instance can run at a time — attempting to start a second will print an error and exit.
+`stop` sends SIGTERM to the running daemon via its PID file (`~/.honeyhive/daemon/daemon.pid`). The daemon flushes any remaining spooled events before exiting. Only one instance can run at a time — attempting to start a second will print an error and exit.
 
 ### Events
 
@@ -68,9 +73,10 @@ Each Claude Code session produces a tree of events in HoneyHive:
 | Event name | Type | Description |
 |------------|------|-------------|
 | `session.start` | `session` | Root event. All other events are children of this. |
-| `turn.user` | `model` | User prompt. `inputs.chat_history` accumulates the full conversation so far; `outputs.content` is the new message. |
-| `turn.agent` | `model` | Assistant response. `inputs.chat_history` accumulates the full conversation so far; `outputs.content` is the new message. |
+| `turn.user` | `chain` | User prompt. `inputs.chat_history` is prior context; `outputs.content` is this message. |
+| `turn.agent` | `model` | Assistant response. `inputs.chat_history` is prior context; `outputs.content` is this message. |
 | `tool.{ToolName}` | `tool` | Tool use (e.g. `tool.Bash`, `tool.Edit`, `tool.Read`, `tool.Grep`). Pre and post hooks are merged into a single event with `start_time`/`end_time` duration. |
+| `chain.instructions.loaded` | `chain` | `CLAUDE.md` or `.claude/rules/*.md` loaded into context ([InstructionsLoaded](https://code.claude.com/docs/en/hooks)). `outputs.content` is read from disk at ingest; metadata has `file.path`, `instructions.memory_type`, `instructions.load_reason`. Does not cover skills or prompt expansion. |
 | `session.end` | `chain` | Marks session completion. |
 | `chain.commit_link` | `chain` | Git commit metadata (requires `--repo`). |
 
@@ -78,10 +84,10 @@ Tool events include `inputs.thinking` when a reasoning block precedes the tool c
 
 #### Session artifacts
 
-When a session ends (or goes idle), the daemon pushes two different views of the conversation:
+When a session ends, the daemon pushes final session views:
 
-- **`session.start`** receives `outputs.chat_history` — this is the user-facing conversation: the back-and-forth of user messages and assistant responses, basically what you'd see in the chat UI. Useful for reviewing what was said and evaluating response quality.
-- **`session.end`** receives `outputs.artifact` containing the full session transcript — this is the complete trajectory of everything that happened under the hood, including tool calls, reasoning/thinking blocks, and internal processing steps. Think of it as the "behind the scenes" view of how the agent actually worked through the task.
+- **`session.start.inputs.chat_history`** holds the initial user message; **`session.start.outputs.chat_history`** holds the rest of the user↔agent conversation (assistant replies and follow-up user turns). Both are filled in after session finalization so the session root is easy to review in HoneyHive.
+- **`session.end.outputs.artifact`** contains the full session transcript — this is the complete trajectory of everything that happened under the hood, including tool calls, reasoning/thinking blocks, and internal processing steps. Think of it as the "behind the scenes" view of how the agent actually worked through the task.
 
 This split lets you look at the same session from two angles: the conversation-level view for understanding what the user experienced, and the trajectory-level view for debugging agent behavior and understanding how it got there.
 
@@ -103,10 +109,10 @@ All daemon state lives under `~/.honeyhive/daemon/` (override with `HH_DAEMON_HO
 
 | Command | Description |
 |---------|-------------|
-| `honeyhive-daemon init` | Scaffold `.honeyhive/config.json` + `.honeyhive/config.local.json` in the current repo. |
+| `honeyhive-daemon init` | Scaffold `.honeyhive/` in the current repo (API key env var reference). Set `HH_API_URL` in the environment for non-default endpoints; project comes from your API key. |
 | `honeyhive-daemon run` | Start the daemon, install hooks, and flush queued events. |
 | `honeyhive-daemon stop` | Stop the running daemon. |
-| `honeyhive-daemon status` | Show config and pending spool event count. |
+| `honeyhive-daemon status` | Show config, pending spool event count, and failure reasons for spooled events. |
 | `honeyhive-daemon doctor` | Check that hooks and config are correctly installed. |
 | `honeyhive-daemon analyze` | Query HoneyHive traces for a time window and emit a JSON report of recurring error patterns. |
 | `honeyhive-daemon add-to-ci` | Generate a GitHub Actions workflow that runs `analyze` on a schedule and opens PRs for recurring patterns. |
@@ -116,8 +122,7 @@ All daemon state lives under `~/.honeyhive/daemon/` (override with `HH_DAEMON_HO
 | Flag | Env var | Description |
 |------|---------|-------------|
 | `--key` | `HH_API_KEY` | HoneyHive API key (required). |
-| `--url` | `HH_API_URL` | HoneyHive base URL (default: `https://api.honeyhive.ai`). |
-| `--project` | `HH_PROJECT` | HoneyHive project name (default: repo/directory name). |
+| `--url` | `HH_API_URL` | Data plane URL (default: `https://api.dp1.us.prod.honeyhive.ai`; omit env var to use default). |
 | `--repo PATH` | | Git repo to attach commit events to. |
 | `--ci` | | Enable CI mode. |
 
@@ -125,7 +130,6 @@ All daemon state lives under `~/.honeyhive/daemon/` (override with `HH_DAEMON_HO
 
 | Flag | Env var | Description |
 |------|---------|-------------|
-| `--project`, `-p` | `HH_PROJECT` | HoneyHive project name. Falls back to `.honeyhive/config.json`. |
 | `--since` | | Time window: `24h`, `7d`, `2w`. Default `24h`. |
 | `--out`, `-o` | | Output path (`-` for stdout). Default `-`. |
 | `--url` | `HH_API_URL` | HoneyHive base URL. |
@@ -142,7 +146,6 @@ honeyhive-daemon analyze --since 7d --out patterns.json
 | Flag | Description |
 |------|-------------|
 | `--cadence` | `hourly` / `daily` / `weekly`. Default `daily`. |
-| `--project`, `-p` | HoneyHive project name. Falls back to `.honeyhive/config.json`. |
 | `--output-dir` | Where to write the workflow file. Default `.github/workflows/` in cwd. |
 
 Writes `.github/workflows/hh-proactive-improvements.yml` and scaffolds `.honeyhive/error-categories.json` if missing. The workflow runs `honeyhive-daemon analyze` on the chosen cadence, then invokes Claude Code to open PRs for any actionable patterns.
@@ -154,7 +157,7 @@ honeyhive-daemon add-to-ci --cadence weekly
 After running, add these to your GitHub repo (Settings → Secrets and variables → Actions):
 
 - **Secrets:** `HH_API_KEY`, `ANTHROPIC_API_KEY`
-- **Variables:** `HH_API_URL` (optional; defaults to `https://api.honeyhive.ai`)
+- **Variables:** `HH_API_URL` (optional; defaults to `https://api.dp1.us.prod.honeyhive.ai`)
 
 Commit the generated workflow file and push. Trigger immediately with `gh workflow run hh-proactive-improvements.yml`.
 
@@ -164,12 +167,10 @@ If events aren't showing up in HoneyHive, work through these checks in order:
 
 1. **Is the daemon running?** Check `~/.honeyhive/daemon/daemon.pid` and verify the process is alive with `ps`.
 2. **Check the log.** `tail -100 ~/.honeyhive/daemon/daemon.log` — look for `spooled` (export failures) or missing `received claude hook` entries.
-3. **Verify config.** `cat ~/.honeyhive/daemon/state/config.json` — confirm API key, project, and base URL are correct.
+3. **Verify config.** `cat ~/.honeyhive/daemon/state/config.json` — confirm API key and base URL are correct.
 4. **Hooks installed?** Run `honeyhive-daemon doctor` or inspect `~/.claude/settings.json` for the hook command.
 5. **Spool buildup?** `wc -l ~/.honeyhive/daemon/spool/events.jsonl` — if events are piling up, check the `spool_reason` field for error details.
 6. **PATH issues.** Ensure `honeyhive-daemon` is on PATH in the shell context Claude Code uses (`which honeyhive-daemon`). Virtualenv installations may not be visible to hooks.
-
-A detailed troubleshooting guide is available in [`skills/honeyhive-daemon-debug/SKILL.md`](skills/honeyhive-daemon-debug/SKILL.md).
 
 ### Evaluators
 
@@ -196,7 +197,7 @@ The repo includes a suite of server-side evaluators that run automatically on se
 
 **Client-side metrics** (computed by the daemon and attached to session events):
 
-`coding_agent.total_events`, `coding_agent.tool_count`, `coding_agent.model_count`, `coding_agent.unique_tools`, `coding_agent.bash_ratio`, `coding_agent.search_ratio`, `coding_agent.tool_model_ratio`, `coding_agent.permission_ratio`, `coding_agent.has_errors`, `coding_agent.subagent_balanced`
+`coding_agent.event_count`, `coding_agent.tool_count`, `coding_agent.model_count`, `coding_agent.unique_tools`, `coding_agent.bash_ratio`, `coding_agent.search_ratio`, `coding_agent.tool_model_ratio`, `coding_agent.permission_ratio`, `coding_agent.has_errors`, `coding_agent.subagent_balanced`
 
 #### Managing evaluators
 
@@ -239,7 +240,7 @@ Unlike the Claude Code daemon (which captures events in real-time via hooks), th
 2. Maps each Devin session to a HoneyHive session event via `POST /session/start`
 3. Fetches session messages and creates child events for each user/agent message
 4. Fetches internal processing events (shell commands, git operations, browser actions, file edits) and exports them as tool/model child events
-5. Updates the session event with `outputs.chat_history` (the full user↔agent conversation) and `outputs.structured_output` when available
+5. Updates the session event with `inputs.chat_history` (initial user message), `outputs.chat_history` (conversation continuation), and `outputs.structured_output` when available
 6. Emits a `session.end` chain event with `outputs.artifact` for completed sessions (status: finished/stopped/failed) — this enables server-side evaluators to run on Devin sessions
 7. On subsequent syncs, updates previously-synced sessions via `PUT /events` and incrementally syncs new messages and internal events
 8. Tracks sync state (last sync timestamp + session ID mapping + message/event counts) in a local JSON file
@@ -354,7 +355,7 @@ Noisy internal events (checkpoints, activity updates, terminal updates) are filt
 
 Emitted when a Devin session reaches `finished`, `stopped`, or `failed` status. Carries `outputs.artifact` with the full conversation as structured content, enabling server-side evaluators to analyze the session.
 
-The session event also receives `outputs.chat_history` — a list of `{"role": "user"|"assistant", "content": "..."}` entries representing the full conversation.
+The session event also receives split chat history: `inputs.chat_history` for the first user message and `outputs.chat_history` for the rest of the `{"role": "user"|"assistant", "content": "..."}` conversation.
 
 ### GitHub Actions Workflow
 

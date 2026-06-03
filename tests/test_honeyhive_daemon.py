@@ -3,21 +3,178 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from click.testing import CliRunner
 
 from honeyhive_daemon.ci import _extract_error
-from honeyhive_daemon.claude_hooks import install_claude_hooks, normalize_claude_payload
+from honeyhive_daemon.claude_hooks import (
+    _is_daemon_hook_command,
+    get_hook_command,
+    install_claude_hooks,
+    normalize_claude_payload,
+)
 from honeyhive_daemon.config import DaemonConfig
 from honeyhive_daemon.exporter import export_event
 from honeyhive_daemon.git_hooks import HOOK_MARKER_START, install_post_commit_hook
-from honeyhive_daemon.main import _push_pending_session_artifacts, cli
+from honeyhive_daemon.main import (
+    _flush_spool,
+    _merge_tool_events,
+    _push_pending_session_artifacts,
+    _session_token_metadata,
+    cli,
+)
 from honeyhive_daemon.state import (
+    append_chat_history,
+    split_session_start_chat_history,
+    append_spool_event,
     get_sessions_needing_artifact,
+    load_session_index,
     mark_session_artifact_pushed,
+    read_spool_events,
     record_session_activity,
 )
+
+
+def test_get_hook_command_uses_resolved_binary(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["pytest"])
+    monkeypatch.setattr(
+        "honeyhive_daemon.claude_hooks.shutil.which",
+        lambda _: "/opt/venv/bin/honeyhive-daemon",
+    )
+    assert (
+        get_hook_command()
+        == "/opt/venv/bin/honeyhive-daemon ingest claude-hook"
+    )
+
+
+def test_get_hook_command_prefers_argv_over_path(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Running ``run`` via absolute path must win over stale PATH entries."""
+    fresh_bin = tmp_path / "fresh" / "bin" / "honeyhive-daemon"
+    fresh_bin.parent.mkdir(parents=True)
+    fresh_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    fresh_bin.chmod(0o755)
+
+    monkeypatch.setattr(sys, "argv", [str(fresh_bin), "run"])
+    monkeypatch.setattr(
+        "honeyhive_daemon.claude_hooks.shutil.which",
+        lambda _: str(tmp_path / "stale" / "bin" / "honeyhive-daemon"),
+    )
+
+    assert get_hook_command() == f"{fresh_bin} ingest claude-hook"
+
+
+def test_get_hook_command_quotes_paths_with_spaces(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["pytest"])
+    monkeypatch.setattr(
+        "honeyhive_daemon.claude_hooks.shutil.which",
+        lambda _: "/opt/my venv/bin/honeyhive-daemon",
+    )
+    assert (
+        get_hook_command()
+        == "'/opt/my venv/bin/honeyhive-daemon' ingest claude-hook"
+    )
+
+
+def test_is_daemon_hook_command_recognizes_exe_and_rejects_wrappers() -> None:
+    assert _is_daemon_hook_command(
+        "C:/Tools/honeyhive-daemon.exe ingest claude-hook"
+    )
+    assert _is_daemon_hook_command(
+        "/opt/venv/bin/honeyhive-daemon ingest claude-hook"
+    )
+    assert _is_daemon_hook_command(
+        '"C:\\Program Files\\HoneyHive\\honeyhive-daemon.exe" ingest claude-hook'
+    )
+    assert not _is_daemon_hook_command(
+        "echo warmup && /opt/venv/bin/honeyhive-daemon ingest claude-hook"
+    )
+
+
+def test_install_claude_hooks_idempotent_windows_quoted_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings_path = tmp_path / "settings.json"
+    quoted_cmd = (
+        '"C:\\Program Files\\HoneyHive\\honeyhive-daemon.exe" ingest claude-hook'
+    )
+    settings_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": quoted_cmd,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    changed = install_claude_hooks(settings_path, quoted_cmd)
+    changed_again = install_claude_hooks(settings_path, quoted_cmd)
+
+    data = json.loads(settings_path.read_text(encoding="utf-8"))
+    commands = [
+        hook["command"]
+        for entry in data["hooks"]["SessionStart"]
+        for hook in entry["hooks"]
+        if hook.get("type") == "command"
+    ]
+    assert changed is True
+    assert changed_again is False
+    assert commands.count(quoted_cmd) == 1
+
+
+def test_install_claude_hooks_replaces_legacy_bare_command(tmp_path: Path) -> None:
+    """Re-install removes bare-path hooks and leaves a single absolute hook."""
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "honeyhive-daemon ingest claude-hook",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    install_claude_hooks(
+        settings_path, "/opt/venv/bin/honeyhive-daemon ingest claude-hook"
+    )
+
+    data = json.loads(settings_path.read_text(encoding="utf-8"))
+    commands = [
+        hook["command"]
+        for entry in data["hooks"]["SessionStart"]
+        for hook in entry["hooks"]
+        if hook.get("type") == "command"
+    ]
+    assert commands == ["/opt/venv/bin/honeyhive-daemon ingest claude-hook"]
 
 
 def test_install_claude_hooks_idempotent(tmp_path: Path) -> None:
@@ -82,7 +239,7 @@ def test_normalize_claude_session_start_with_transcript_session_name(
         json.dumps(
             {
                 "type": "custom-title",
-                "customTitle": "waggle-focus-watcher",
+                "customTitle": "release-focus-watcher",
                 "sessionId": "sess-name-1",
             }
         )
@@ -100,7 +257,7 @@ def test_normalize_claude_session_start_with_transcript_session_name(
     )
 
     assert event is not None
-    assert event["metadata"]["session_name"] == "waggle-focus-watcher"
+    assert event["metadata"]["session_name"] == "release-focus-watcher"
 
 
 def test_normalize_claude_session_name_from_payload() -> None:
@@ -172,7 +329,7 @@ def test_normalize_claude_bash_tool() -> None:
     assert event["outputs"]["tool_response"] == {"exit_code": 0}
 
 
-def test_normalize_claude_stop_event_is_chain() -> None:
+def test_normalize_claude_stop_event_is_model() -> None:
     event = normalize_claude_payload(
         {
             "hook_event_name": "Stop",
@@ -198,12 +355,104 @@ def test_normalize_claude_user_prompt_event() -> None:
 
     assert event is not None
     assert event["event_name"] == "turn.user"
-    assert event["event_type"] == "model"
+    assert event["event_type"] == "chain"
     assert event["parent_id"] == "sess-prompt-1"
     # chat_history is injected at ingest time from session state, not at normalize time
     assert "chat_history" not in event.get("inputs", {})
     assert event["outputs"]["role"] == "user"
     assert event["outputs"]["content"] == "show me the failing tests"
+
+
+def test_normalize_instructions_loaded_reads_file_content(tmp_path: Path) -> None:
+    instr = tmp_path / "CLAUDE.md"
+    instr.write_text("# Test\n\nhh-daemon-claude-md-loaded\n", encoding="utf-8")
+
+    event = normalize_claude_payload(
+        {
+            "hook_event_name": "InstructionsLoaded",
+            "session_id": "sess-instr-1",
+            "cwd": str(tmp_path),
+            "file_path": str(instr),
+            "memory_type": "Project",
+            "load_reason": "session_start",
+        }
+    )
+
+    assert event is not None
+    assert event["event_name"] == "chain.instructions.loaded"
+    assert event["metadata"]["file.path"] == str(instr)
+    assert event["metadata"]["instructions.memory_type"] == "Project"
+    assert event["outputs"]["path"] == str(instr)
+    assert event["outputs"]["basename"] == "CLAUDE.md"
+    assert "hh-daemon-claude-md-loaded" in event["outputs"]["content"]
+
+
+def test_record_session_activity_recovers_malformed_index(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from honeyhive_daemon.config import ensure_state_layout, get_sessions_path
+
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    ensure_state_layout()
+    get_sessions_path().write_text("{", encoding="utf-8")
+
+    session = record_session_activity(
+        "sess-lock-recover",
+        transcript_path=None,
+        last_activity_ms=123,
+        session_start_exported=True,
+    )
+
+    assert session["session_id"] == "sess-lock-recover"
+    assert load_session_index()["sess-lock-recover"]["session_start_exported"] is True
+
+
+def test_ingest_instructions_loaded_does_not_synthesize_session_start(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from honeyhive_daemon.config import save_config
+
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    captured: list[dict] = []
+
+    class FakeEventsAPI:
+        def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
+            captured.append(_nested_event_dict(request))
+
+    class FakeHoneyHive:
+        def __init__(self, api_key: str, base_url: str) -> None:
+            self.events = FakeEventsAPI()
+
+    monkeypatch.setattr("honeyhive_daemon.exporter.HoneyHive", FakeHoneyHive)
+    monkeypatch.setattr(
+        "honeyhive_daemon.main.resolve_config",
+        lambda **kw: kw.get("cli_defaults"),
+    )
+    save_config(
+        DaemonConfig(
+            api_key="hh_test",
+            base_url="https://api.honeyhive.ai",
+        )
+    )
+
+    instr = tmp_path / "CLAUDE.md"
+    instr.write_text("# Test\n", encoding="utf-8")
+    payload = json.dumps(
+        {
+            "hook_event_name": "InstructionsLoaded",
+            "session_id": "sess-instr-no-start",
+            "cwd": str(tmp_path),
+            "file_path": str(instr),
+            "memory_type": "Project",
+            "load_reason": "session_start",
+        }
+    )
+
+    result = CliRunner().invoke(cli, ["ingest", "claude-hook"], input=payload)
+    assert result.exit_code == 0, result.output
+    assert [event["event_name"] for event in captured] == [
+        "chain.instructions.loaded"
+    ]
 
 
 def test_normalize_claude_pretool_generic_fallback() -> None:
@@ -300,6 +549,319 @@ def test_cli_status_without_config(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert "Configured: no" in result.output
+    assert "Pending spool events: 0" in result.output
+
+
+def test_cli_status_shows_configured_base_url(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from honeyhive_daemon.config import save_config
+
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    base_url = "https://api.honeyhive.ai"
+    save_config(
+        DaemonConfig(
+            api_key="hh_test",
+            base_url=base_url,
+        )
+    )
+
+    result = CliRunner().invoke(cli, ["status"])
+    assert result.exit_code == 0
+    assert f"Base URL: {base_url}" in result.output.splitlines()
+
+
+def test_cli_status_shows_spool_failure_reason(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    append_spool_event(
+        {
+            "event_name": "session.start",
+            "spool_reason": "Connection refused: honeyhive events endpoint",
+        }
+    )
+
+    result = CliRunner().invoke(cli, ["status"])
+    assert result.exit_code == 0
+    assert "Connection refused" in result.output
+
+
+def test_split_session_start_chat_history() -> None:
+    assert split_session_start_chat_history([]) == ({}, {})
+    assert split_session_start_chat_history(
+        [{"role": "user", "content": "hi"}]
+    ) == (
+        {"chat_history": [{"role": "user", "content": "hi"}]},
+        {"chat_history": []},
+    )
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "world"},
+        {"role": "user", "content": "again"},
+    ]
+    assert split_session_start_chat_history(history) == (
+        {"chat_history": [{"role": "user", "content": "hi"}]},
+        {
+            "chat_history": [
+                {"role": "assistant", "content": "world"},
+                {"role": "user", "content": "again"},
+            ]
+        },
+    )
+
+
+def test_append_chat_history_includes_current_message(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+
+    first = append_chat_history("sess-chat", "user", "first")
+    second = append_chat_history("sess-chat", "assistant", "reply")
+    third = append_chat_history("sess-chat", "user", "second")
+
+    assert first[-1] == {"role": "user", "content": "first"}
+    assert len(second) == 2
+    assert third[-1] == {"role": "user", "content": "second"}
+    assert len(third) == 3
+
+
+def test_ingest_turn_chat_history_excludes_current_message(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from honeyhive_daemon.config import save_config
+
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    captured: list[dict] = []
+
+    class FakeEventsAPI:
+        def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
+            captured.append(_nested_event_dict(request))
+
+    class FakeHoneyHive:
+        def __init__(self, api_key: str, base_url: str) -> None:
+            self.events = FakeEventsAPI()
+
+    monkeypatch.setattr("honeyhive_daemon.exporter.HoneyHive", FakeHoneyHive)
+    monkeypatch.setattr(
+        "honeyhive_daemon.main.resolve_config",
+        lambda **kw: kw.get("cli_defaults"),
+    )
+    save_config(
+        DaemonConfig(
+            api_key="hh_test",
+            base_url="https://api.honeyhive.ai",
+        )
+    )
+
+    user_payload = json.dumps(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "sess-chat-dedupe",
+            "prompt": "hello",
+        }
+    )
+    agent_payload = json.dumps(
+        {
+            "hook_event_name": "Stop",
+            "session_id": "sess-chat-dedupe",
+            "last_assistant_message": "world",
+        }
+    )
+
+    runner = CliRunner()
+    assert runner.invoke(cli, ["ingest", "claude-hook"], input=user_payload).exit_code == 0
+    assert runner.invoke(cli, ["ingest", "claude-hook"], input=agent_payload).exit_code == 0
+
+    turn_events = [e for e in captured if e.get("event_name", "").startswith("turn.")]
+    assert len(turn_events) == 2
+
+    user_event = next(e for e in turn_events if e["event_name"] == "turn.user")
+    assert user_event["inputs"]["chat_history"] == []
+    assert user_event["outputs"]["content"] == "hello"
+
+    agent_event = next(e for e in turn_events if e["event_name"] == "turn.agent")
+    assert agent_event["inputs"]["chat_history"] == [
+        {"role": "user", "content": "hello"},
+    ]
+    assert agent_event["outputs"]["content"] == "world"
+
+
+def test_ingest_tool_usage_attached_once_per_api_request(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from honeyhive_daemon.config import save_config
+    from honeyhive_daemon.transcript import TranscriptContext
+
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    captured: list[dict] = []
+
+    class FakeEventsAPI:
+        def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
+            captured.append(_nested_event_dict(request))
+
+    class FakeHoneyHive:
+        def __init__(self, api_key: str, base_url: str) -> None:
+            self.events = FakeEventsAPI()
+
+    def fake_get_context(transcript_path: str, tool_use_id: str) -> TranscriptContext:
+        ctx = TranscriptContext()
+        ctx.request_id = "req-shared"
+        ctx.usage = {"input_tokens": 2739, "output_tokens": 238}
+        ctx.model = "claude-opus-4-8"
+        return ctx
+
+    monkeypatch.setattr("honeyhive_daemon.exporter.HoneyHive", FakeHoneyHive)
+    monkeypatch.setattr(
+        "honeyhive_daemon.main.get_context_for_tool_use", fake_get_context
+    )
+    monkeypatch.setattr(
+        "honeyhive_daemon.main.resolve_config",
+        lambda **kw: kw.get("cli_defaults"),
+    )
+    save_config(
+        DaemonConfig(
+            api_key="hh_test",
+            base_url="https://api.honeyhive.ai",
+        )
+    )
+
+    runner = CliRunner()
+    for tool_name, tool_use_id in (
+        ("Read", "toolu_read"),
+        ("Bash", "toolu_bash"),
+    ):
+        payload = json.dumps(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "sess-tool-tokens",
+                "tool_name": tool_name,
+                "tool_use_id": tool_use_id,
+                "tool_input": {"command": "echo hi"},
+                "tool_response": {"stdout": "hi"},
+                "transcript_path": str(tmp_path / "transcript.jsonl"),
+            }
+        )
+        result = runner.invoke(cli, ["ingest", "claude-hook"], input=payload)
+        assert result.exit_code == 0, result.output
+
+    tool_events = [e for e in captured if e.get("event_type") == "tool"]
+    assert len(tool_events) == 2
+    with_tokens = [
+        e for e in tool_events if e.get("metadata", {}).get("prompt_tokens") is not None
+    ]
+    assert len(with_tokens) == 1
+    assert with_tokens[0]["metadata"]["prompt_tokens"] == 2739
+
+
+def test_merge_tool_events_uses_reported_duration_and_keeps_wall_time() -> None:
+    pre_event = {
+        "event_id": "tool-event-1",
+        "session_id": "sess-tools",
+        "event_type": "tool",
+        "event_name": "tool.Read",
+        "start_time": 1000,
+        "end_time": 1000,
+        "inputs": {"tool_input": {"file_path": "README.md"}},
+        "metadata": {"tool.name": "Read"},
+        "raw": {"hook_event_name": "PreToolUse"},
+    }
+    post_event = {
+        "event_id": "post-event",
+        "session_id": "sess-tools",
+        "event_type": "tool",
+        "event_name": "tool.Read",
+        "start_time": 2500,
+        "end_time": 2500,
+        "inputs": {"tool_input": {"file_path": "README.md"}},
+        "outputs": {"tool_response": {"type": "text"}},
+        "metadata": {"tool.status": "success"},
+        "raw": {"hook_event_name": "PostToolUse", "duration_ms": 25},
+    }
+
+    merged = _merge_tool_events(pre_event, post_event)
+
+    assert merged["event_id"] == "tool-event-1"
+    assert merged["duration"] == 25
+    assert merged["end_time"] == 2500
+    assert merged["start_time"] == 2475
+    assert merged["metadata"]["tool.wall_duration_ms"] == 1500
+    assert merged["metadata"]["tool.reported_duration_ms"] == 25
+
+
+def test_session_token_metadata_aliases_coding_agent_metrics() -> None:
+    metadata = _session_token_metadata(
+        {
+            "coding_agent.total_input_tokens": 123.0,
+            "coding_agent.total_output_tokens": 45.0,
+            "coding_agent.total_tokens": 168.0,
+            "coding_agent.total_cache_read_tokens": 1000.0,
+            "coding_agent.total_cache_creation_tokens": 50.0,
+        }
+    )
+
+    assert metadata == {
+        "prompt_tokens": 123.0,
+        "completion_tokens": 45.0,
+        "total_tokens": 168.0,
+    }
+
+
+def test_ingest_session_end_logs_session_id(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from honeyhive_daemon.config import save_config
+
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    log_messages: list[str] = []
+
+    exported_events: list[dict] = []
+
+    class FakeEventsAPI:
+        def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
+            exported_events.append(_nested_event_dict(request))
+
+    class FakeHoneyHive:
+        def __init__(self, api_key: str, base_url: str) -> None:
+            self.events = FakeEventsAPI()
+
+    monkeypatch.setattr("honeyhive_daemon.exporter.HoneyHive", FakeHoneyHive)
+    monkeypatch.setattr(
+        "honeyhive_daemon.exporter.log_message",
+        lambda message: log_messages.append(message),
+    )
+    monkeypatch.setattr(
+        "honeyhive_daemon.main.resolve_config",
+        lambda **kw: kw.get("cli_defaults"),
+    )
+    config = DaemonConfig(
+        api_key="hh_test",
+        base_url="https://api.honeyhive.ai",
+    )
+    save_config(config)
+
+    payload = json.dumps(
+        {
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-log-test",
+            "event": {"event_id": "evt-log-test"},
+        }
+    )
+    result = CliRunner().invoke(cli, ["ingest", "claude-hook"], input=payload)
+    assert result.exit_code == 0, result.output
+    assert exported_events == []
+
+    _flush_spool(config)
+
+    assert any(e["event_name"] == "session.end" for e in exported_events)
+    assert any(
+        "session ended" in msg and "sess-log-test" in msg for msg in log_messages
+    )
+
+
+def _nested_event_dict(request) -> dict:  # type: ignore[no-untyped-def]
+    event = request.event
+    return event.model_dump() if hasattr(event, "model_dump") else event
 
 
 def test_export_session_event_includes_session_name(monkeypatch, tmp_path: Path) -> None:
@@ -309,7 +871,7 @@ def test_export_session_event_includes_session_name(monkeypatch, tmp_path: Path)
 
     class FakeEventsAPI:
         def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
-            captured["event"] = request.event
+            captured["event"] = _nested_event_dict(request)
 
     class FakeHoneyHive:
         def __init__(self, api_key: str, base_url: str) -> None:
@@ -320,7 +882,6 @@ def test_export_session_event_includes_session_name(monkeypatch, tmp_path: Path)
     config = DaemonConfig(
         api_key="hh_test",
         base_url="https://api.honeyhive.ai",
-        project="test-project",
     )
     event = {
         "event_id": "sess-1",
@@ -330,16 +891,16 @@ def test_export_session_event_includes_session_name(monkeypatch, tmp_path: Path)
         "start_time": 1000,
         "end_time": 1000,
         "duration": 0,
-        "metadata": {"session_name": "waggle-focus-watcher"},
+        "metadata": {"session_name": "release-focus-watcher"},
         "inputs": {},
         "outputs": {},
     }
 
     export_event(config, event)
 
-    assert captured["event"]["session_name"] == "waggle-focus-watcher"
+    assert captured["event"]["session_name"] == "release-focus-watcher"
     # Also preserved in metadata
-    assert captured["event"]["metadata"]["session_name"] == "waggle-focus-watcher"
+    assert captured["event"]["metadata"]["session_name"] == "release-focus-watcher"
 
 
 def test_export_tool_event_no_session_name_field(monkeypatch, tmp_path: Path) -> None:
@@ -349,7 +910,7 @@ def test_export_tool_event_no_session_name_field(monkeypatch, tmp_path: Path) ->
 
     class FakeEventsAPI:
         def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
-            captured["event"] = request.event
+            captured["event"] = _nested_event_dict(request)
 
     class FakeHoneyHive:
         def __init__(self, api_key: str, base_url: str) -> None:
@@ -360,7 +921,6 @@ def test_export_tool_event_no_session_name_field(monkeypatch, tmp_path: Path) ->
     config = DaemonConfig(
         api_key="hh_test",
         base_url="https://api.honeyhive.ai",
-        project="test-project",
     )
     event = {
         "event_id": "evt-1",
@@ -371,7 +931,7 @@ def test_export_tool_event_no_session_name_field(monkeypatch, tmp_path: Path) ->
         "start_time": 1000,
         "end_time": 1000,
         "duration": 0,
-        "metadata": {"session_name": "waggle-focus-watcher"},
+        "metadata": {"session_name": "release-focus-watcher"},
         "inputs": {},
         "outputs": {},
     }
@@ -380,7 +940,7 @@ def test_export_tool_event_no_session_name_field(monkeypatch, tmp_path: Path) ->
 
     assert "session_name" not in captured["event"]
     # But still in metadata for queryability
-    assert captured["event"]["metadata"]["session_name"] == "waggle-focus-watcher"
+    assert captured["event"]["metadata"]["session_name"] == "release-focus-watcher"
 
 
 def test_export_event_posts_honeyhive_event(monkeypatch, tmp_path: Path) -> None:
@@ -389,7 +949,7 @@ def test_export_event_posts_honeyhive_event(monkeypatch, tmp_path: Path) -> None
 
     class FakeEventsAPI:
         def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
-            captured["event"] = request.event
+            captured["event"] = _nested_event_dict(request)
 
     class FakeHoneyHive:
         def __init__(self, api_key: str, base_url: str) -> None:
@@ -402,7 +962,6 @@ def test_export_event_posts_honeyhive_event(monkeypatch, tmp_path: Path) -> None
     config = DaemonConfig(
         api_key="hh_test",
         base_url="https://api.honeyhive.ai",
-        project="ignored-project",
     )
     event = {
         "event_id": "evt-1",
@@ -424,7 +983,7 @@ def test_export_event_posts_honeyhive_event(monkeypatch, tmp_path: Path) -> None
     assert captured["api_key"] == "hh_test"
     assert captured["base_url"] == "https://api.honeyhive.ai"
     assert captured["event"]["event_id"] == "evt-1"
-    assert captured["event"]["project"] == "ignored-project"
+    assert not captured["event"].get("project")
     assert captured["event"]["event_type"] == "tool"
     assert captured["event"]["event_name"] == "tool.bash"
     assert captured["event"]["parent_id"] == "sess-1"
@@ -471,7 +1030,6 @@ def test_push_pending_session_artifacts_updates_root_event(
     def fake_update_event_outputs(config, *, event_id, outputs):  # type: ignore[no-untyped-def]
         captured.append(
             {
-                "project": config.project,
                 "event_id": event_id,
                 "outputs": outputs,
             }
@@ -486,20 +1044,38 @@ def test_push_pending_session_artifacts_updates_root_event(
         fake_update_event_outputs,
     )
 
-    metrics_captured = []
+    session_start_updates = []
 
-    def fake_update_event(config, *, event_id, inputs=None, outputs=None, metrics=None):  # type: ignore[no-untyped-def]
-        metrics_captured.append({"event_id": event_id, "metrics": metrics})
+    def fake_update_event(  # type: ignore[no-untyped-def]
+        config, *, event_id, inputs=None, outputs=None, metadata=None, metrics=None
+    ):
+        if inputs is not None or outputs is not None:
+            session_start_updates.append(
+                {
+                    "event_id": event_id,
+                    "inputs": inputs,
+                    "outputs": outputs,
+                }
+            )
+        if metrics is not None:
+            session_start_updates.append(
+                {
+                    "event_id": event_id,
+                    "metadata": metadata,
+                    "metrics": metrics,
+                }
+            )
 
     monkeypatch.setattr(
         "honeyhive_daemon.exporter.update_event",
         fake_update_event,
     )
 
-    # Accumulate chat history so the root event update fires
+    # Accumulate chat history so the session.start update includes the final chat.
     from honeyhive_daemon.state import append_chat_history
 
     append_chat_history("sess-root-1", "user", "hi")
+    append_chat_history("sess-root-1", "assistant", "done")
 
     record_session_activity(
         "sess-root-1",
@@ -512,27 +1088,135 @@ def test_push_pending_session_artifacts_updates_root_event(
     config = DaemonConfig(
         api_key="hh_test",
         base_url="https://api.honeyhive.ai",
-        project="demo",
     )
     _push_pending_session_artifacts(config)
 
-    # Root event gets chat_history, end event gets full artifact
-    assert [item["event_id"] for item in captured] == ["sess-root-1", "sess-end-1"]
-    assert all(item["project"] == "demo" for item in captured)
-    # Root event: chat_history only
-    assert "chat_history" in captured[0]["outputs"]
-    assert captured[0]["outputs"]["chat_history"] == [{"role": "user", "content": "hi"}]
-    # End event: full artifact transcript
-    assert captured[1]["outputs"]["artifact"]["path"] == str(transcript_path)
-    assert captured[1]["outputs"]["artifact"]["content"] == [
+    assert [item["event_id"] for item in captured] == ["sess-end-1"]
+    assert len(captured) == 1
+    chat_update = next(
+        item
+        for item in session_start_updates
+        if item.get("inputs") is not None or item.get("outputs") is not None
+    )
+    assert chat_update["event_id"] == "sess-root-1"
+    assert chat_update["inputs"] == {
+        "chat_history": [{"role": "user", "content": "hi"}]
+    }
+    assert chat_update["outputs"] == {
+        "chat_history": [{"role": "assistant", "content": "done"}]
+    }
+    # End event gets only the full artifact transcript.
+    assert captured[0]["outputs"]["artifact"]["path"] == str(transcript_path)
+    assert captured[0]["outputs"]["artifact"]["content"] == [
         {"type": "user", "message": "hi"}
     ]
-    assert captured[1]["outputs"]["artifact"]["format"] == "json"
-    assert captured[1]["outputs"]["artifact"]["reason"] == "session_end"
-    # Metrics were attached to the root event
-    assert len(metrics_captured) == 1
-    assert metrics_captured[0]["event_id"] == "sess-root-1"
-    assert "coding_agent.total_events" in metrics_captured[0]["metrics"]
+    assert captured[0]["outputs"]["artifact"]["format"] == "json"
+    assert captured[0]["outputs"]["artifact"]["reason"] == "session_end"
+    assert "chat_history" not in captured[0]["outputs"]
+    metrics_update = next(item for item in session_start_updates if "metrics" in item)
+    assert metrics_update["event_id"] == "sess-root-1"
+    assert "coding_agent.event_count" in metrics_update["metrics"]
+    assert metrics_update["metadata"] is None
+
+
+def test_push_pending_session_artifacts_finalizes_idle_unended_sessions(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        '{"type":"user","message":{"role":"user","content":"hi"}}\n',
+        encoding="utf-8",
+    )
+    record_session_activity(
+        "sess-orphan",
+        transcript_path=str(transcript_path),
+        last_activity_ms=1000,
+        session_start_exported=True,
+    )
+
+    exported_events: list[dict] = []
+    monkeypatch.setattr(
+        "honeyhive_daemon.main.export_event",
+        lambda _config, event: exported_events.append(event),
+    )
+    updated_events: list[dict] = []
+    monkeypatch.setattr(
+        "honeyhive_daemon.exporter.update_event_outputs",
+        lambda *a, **kw: updated_events.append(kw),
+    )
+    monkeypatch.setattr(
+        "honeyhive_daemon.exporter.update_event",
+        lambda *a, **kw: updated_events.append(kw),
+    )
+    from honeyhive_daemon.state import append_chat_history
+
+    append_chat_history("sess-orphan", "user", "hi")
+    idle_ms = 24 * 60 * 60 * 1000
+    monkeypatch.setattr(
+        "honeyhive_daemon.main._now_ms",
+        lambda: 1000 + idle_ms + 1,
+    )
+
+    config = DaemonConfig(
+        api_key="hh_test",
+        base_url="https://api.honeyhive.ai",
+    )
+    _push_pending_session_artifacts(config)
+
+    assert exported_events == []
+    assert updated_events
+    assert any(
+        update.get("event_id") == "sess-orphan" and update.get("metrics")
+        for update in updated_events
+    )
+    assert all(update.get("event_id") != "sess-end-orphan" for update in updated_events)
+    index = load_session_index()
+    assert index["sess-orphan"].get("ended") is not True
+    assert index["sess-orphan"].get("artifact_pushed") is True
+
+
+def test_push_pending_session_artifacts_stops_after_max_retries(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    monkeypatch.setattr("honeyhive_daemon.main._now_ms", lambda: 2000)
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        '{"type":"user","message":{"role":"user","content":"hi"}}\n',
+        encoding="utf-8",
+    )
+    record_session_activity(
+        "sess-retry-cap",
+        transcript_path=str(transcript_path),
+        last_activity_ms=1000,
+        ended=True,
+        session_end_event_id="sess-end-cap",
+    )
+
+    def fail_update_outputs(_config, *, event_id, outputs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("400 Bad Request")
+
+    monkeypatch.setattr(
+        "honeyhive_daemon.exporter.update_event_outputs",
+        fail_update_outputs,
+    )
+    monkeypatch.setattr(
+        "honeyhive_daemon.exporter.update_event",
+        lambda *a, **kw: None,
+    )
+
+    config = DaemonConfig(
+        api_key="hh_test",
+        base_url="https://api.honeyhive.ai",
+    )
+    for _ in range(4):
+        _push_pending_session_artifacts(config)
+
+    index = load_session_index()
+    assert index["sess-retry-cap"]["artifact_pushed"] is True
+    assert index["sess-retry-cap"].get("artifact_retry_count", 0) >= 3
 
 
 # ---------------------------------------------------------------------------

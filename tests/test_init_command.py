@@ -17,7 +17,7 @@ class TestInitCommand:
         """init creates .honeyhive/ with config.json + config.local.json."""
         runner = CliRunner()
         with runner.isolated_filesystem(temp_dir=tmp_path) as td:
-            result = runner.invoke(cli, ["init", "--project", "my-project"])
+            result = runner.invoke(cli, ["init"])
             assert result.exit_code == 0, result.output
 
             hh_dir = Path(td) / ".honeyhive"
@@ -26,7 +26,7 @@ class TestInitCommand:
             config = json.loads(
                 (hh_dir / "config.json").read_text(encoding="utf-8")
             )
-            assert config["project"] == "my-project"
+            assert config == {}
 
             local_config = json.loads(
                 (hh_dir / "config.local.json").read_text(encoding="utf-8")
@@ -39,7 +39,7 @@ class TestInitCommand:
         with runner.isolated_filesystem(temp_dir=tmp_path) as td:
             result = runner.invoke(
                 cli,
-                ["init", "--project", "proj", "--api-key-env", "CUSTOM_KEY"],
+                ["init", "--api-key-env", "CUSTOM_KEY"],
             )
             assert result.exit_code == 0, result.output
 
@@ -54,7 +54,7 @@ class TestInitCommand:
         """init creates .gitignore with config.local.json entry."""
         runner = CliRunner()
         with runner.isolated_filesystem(temp_dir=tmp_path) as td:
-            result = runner.invoke(cli, ["init", "--project", "proj"])
+            result = runner.invoke(cli, ["init"])
             assert result.exit_code == 0, result.output
 
             gitignore = Path(td) / ".gitignore"
@@ -69,21 +69,20 @@ class TestInitCommand:
             gitignore = Path(td) / ".gitignore"
             gitignore.write_text("node_modules/\n.env\n", encoding="utf-8")
 
-            result = runner.invoke(cli, ["init", "--project", "proj"])
+            result = runner.invoke(cli, ["init"])
             assert result.exit_code == 0, result.output
 
             content = gitignore.read_text(encoding="utf-8")
             assert content.startswith("node_modules/\n.env\n")
             assert ".honeyhive/config.local.json" in content
-            # Only one occurrence
             assert content.count(".honeyhive/config.local.json") == 1
 
     def test_no_duplicate_gitignore_entry_on_rerun(self, tmp_path: Path) -> None:
         """Running init twice does not duplicate the .gitignore entry."""
         runner = CliRunner()
         with runner.isolated_filesystem(temp_dir=tmp_path) as td:
-            runner.invoke(cli, ["init", "--project", "proj"])
-            runner.invoke(cli, ["init", "--project", "proj"])
+            runner.invoke(cli, ["init"])
+            runner.invoke(cli, ["init"])
 
             content = (Path(td) / ".gitignore").read_text(encoding="utf-8")
             assert content.count(".honeyhive/config.local.json") == 1
@@ -92,14 +91,13 @@ class TestInitCommand:
         """init with existing .honeyhive/ emits a warning and updates files."""
         runner = CliRunner()
         with runner.isolated_filesystem(temp_dir=tmp_path) as td:
-            # Create existing .honeyhive/ with old config
             hh_dir = Path(td) / ".honeyhive"
             hh_dir.mkdir()
             (hh_dir / "config.json").write_text(
-                json.dumps({"project": "old-project"}), encoding="utf-8"
+                json.dumps({"project": "legacy"}), encoding="utf-8"
             )
 
-            result = runner.invoke(cli, ["init", "--project", "new-project"])
+            result = runner.invoke(cli, ["init"])
             assert result.exit_code == 0, result.output
             assert "Warning:" in result.output
             assert "already exists" in result.output
@@ -107,14 +105,13 @@ class TestInitCommand:
             config = json.loads(
                 (hh_dir / "config.json").read_text(encoding="utf-8")
             )
-            assert config["project"] == "new-project"
+            assert config == {}
 
     def test_init_without_git_root_creates_in_cwd(self, tmp_path: Path) -> None:
         """init works in a directory without .git — creates .honeyhive/ in cwd."""
         runner = CliRunner()
         with runner.isolated_filesystem(temp_dir=tmp_path) as td:
-            # No .git directory exists
-            result = runner.invoke(cli, ["init", "--project", "no-git-proj"])
+            result = runner.invoke(cli, ["init"])
             assert result.exit_code == 0, result.output
 
             hh_dir = Path(td) / ".honeyhive"
@@ -122,13 +119,13 @@ class TestInitCommand:
             config = json.loads(
                 (hh_dir / "config.json").read_text(encoding="utf-8")
             )
-            assert config["project"] == "no-git-proj"
+            assert config == {}
 
     def test_output_messages(self, tmp_path: Path) -> None:
         """init prints expected output messages."""
         runner = CliRunner()
         with runner.isolated_filesystem(temp_dir=tmp_path):
-            result = runner.invoke(cli, ["init", "--project", "msg-proj"])
+            result = runner.invoke(cli, ["init"])
             assert result.exit_code == 0
             assert "Created" in result.output
             assert "config.json" in result.output
@@ -140,13 +137,45 @@ class TestInitCommand:
         runner = CliRunner()
         with runner.isolated_filesystem(temp_dir=tmp_path) as td:
             gitignore = Path(td) / ".gitignore"
-            # Write without trailing newline
             gitignore.write_text("node_modules/", encoding="utf-8")
 
-            result = runner.invoke(cli, ["init", "--project", "proj"])
+            result = runner.invoke(cli, ["init"])
             assert result.exit_code == 0, result.output
 
             content = gitignore.read_text(encoding="utf-8")
             lines = content.splitlines()
             assert "node_modules/" in lines
             assert ".honeyhive/config.local.json" in lines
+
+    def test_init_url_persists_base_url(self, tmp_path: Path) -> None:
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path) as td:
+            result = runner.invoke(
+                cli,
+                [
+                    "init",
+                    "--url",
+                    "https://custom.api.honeyhive.ai",
+                ],
+            )
+            assert result.exit_code == 0, result.output
+
+            local_config = json.loads(
+                (Path(td) / ".honeyhive" / "config.local.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert local_config["base_url"] == "https://custom.api.honeyhive.ai"
+
+    def test_init_without_url_omits_base_url(self, tmp_path: Path) -> None:
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path) as td:
+            result = runner.invoke(cli, ["init"])
+            assert result.exit_code == 0, result.output
+
+            local_config = json.loads(
+                (Path(td) / ".honeyhive" / "config.local.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert "base_url" not in local_config

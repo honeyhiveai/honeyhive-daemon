@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,9 +21,78 @@ from .mappings import (
 )
 
 
+_DAEMON_HOOK_ARGS = ("ingest", "claude-hook")
+_DAEMON_EXECUTABLE_NAMES = frozenset({"honeyhive-daemon", "honeyhive-daemon.exe"})
+_INSTRUCTIONS_MAX_BYTES = 65_536
+
+
+def _strip_executable_quotes(executable: str) -> str:
+    """Strip matching surrounding quotes from a parsed executable path."""
+    if (
+        len(executable) >= 2
+        and executable[0] == executable[-1]
+        and executable[0] in ('"', "'")
+    ):
+        return executable[1:-1]
+    return executable
+
+
+def _split_hook_command(command: str) -> tuple[str, list[str]]:
+    """Split a hook command string into executable and args."""
+    text = command.strip()
+    if not text:
+        return "", []
+    for posix in (os.name != "nt", False):
+        try:
+            parts = shlex.split(text, posix=posix)
+        except ValueError:
+            continue
+        if parts:
+            return _strip_executable_quotes(parts[0]), parts[1:]
+    return "", []
+
+
+def _resolve_daemon_binary() -> str:
+    """Return the daemon binary path to register in Claude hook commands."""
+    if sys.argv:
+        candidate = Path(sys.argv[0]).resolve()
+        if candidate.name in _DAEMON_EXECUTABLE_NAMES and candidate.is_file():
+            return str(candidate)
+    resolved = shutil.which("honeyhive-daemon")
+    if resolved:
+        return resolved
+    return "honeyhive-daemon"
+
+
+def _executable_basename(executable: str) -> str:
+    """Return the final path segment, normalizing Windows separators."""
+    return Path(executable.replace("\\", "/")).name
+
+
+def _is_daemon_hook_command(command: str) -> bool:
+    """True if *command* invokes this repo's Claude ingest hook."""
+    executable, args = _split_hook_command(command)
+    if _executable_basename(executable) not in _DAEMON_EXECUTABLE_NAMES:
+        return False
+    return tuple(args) == _DAEMON_HOOK_ARGS
+
+
+def _format_hook_command(daemon_bin: str) -> str:
+    """Build a shell-safe hook command for the resolved daemon binary."""
+    argv = [daemon_bin, *_DAEMON_HOOK_ARGS]
+    if os.name == "nt":
+        return subprocess.list2cmdline(argv)
+    return shlex.join(argv)
+
+
 def get_hook_command() -> str:
-    """Return the command registered in Claude settings."""
-    return "honeyhive-daemon ingest claude-hook"
+    """Return the command registered in Claude settings.
+
+    Uses an absolute path to the ``honeyhive-daemon`` binary that is running
+    ``run``, so Claude Code hooks do not pick up a different install on PATH
+    (e.g. a pyenv shim without the ``honeyhive`` dependency).
+    """
+    return _format_hook_command(_resolve_daemon_binary())
 
 
 def install_claude_hooks(settings_path: Path, command: str) -> bool:
@@ -65,7 +139,8 @@ def _sync_hook_entries(
             hook
             for hook in entry.get("hooks", [])
             if not (
-                hook.get("type") == "command" and hook.get("command") == command
+                hook.get("type") == "command"
+                and _is_daemon_hook_command(str(hook.get("command", "")))
             )
         ]
         if not remaining_hooks:
@@ -155,7 +230,44 @@ def normalize_claude_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]
         if hook_event_name == "PostToolUseFailure":
             event["_hook_failure"] = True
 
+    if hook_event_name == "InstructionsLoaded":
+        _enrich_instructions_loaded(event, payload)
+
     return event
+
+
+def _enrich_instructions_loaded(event: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    """Read instruction file content into outputs.
+
+    Claude Code's InstructionsLoaded hook is observability-only and does not
+    include file content — only path, memory_type, and load_reason. We read the
+    file at ingest time so HoneyHive exports are inspectable.
+    """
+    file_path = payload.get("file_path")
+    if not file_path:
+        return
+
+    path = Path(str(file_path))
+    outputs: Dict[str, Any] = dict(event.get("outputs") or {})
+    outputs["path"] = str(path)
+    outputs["basename"] = path.name
+
+    if path.is_file():
+        try:
+            raw = path.read_bytes()
+            if len(raw) > _INSTRUCTIONS_MAX_BYTES:
+                text = raw[:_INSTRUCTIONS_MAX_BYTES].decode("utf-8", errors="replace")
+                outputs["content"] = text + "\n\n[... truncated ...]"
+                outputs["truncated"] = True
+            else:
+                outputs["content"] = raw.decode("utf-8", errors="replace")
+                outputs["truncated"] = False
+        except OSError:
+            outputs["read_error"] = "could not read file"
+    else:
+        outputs["read_error"] = "file not found"
+
+    event["outputs"] = outputs
 
 
 # Cache for session names keyed by transcript path.

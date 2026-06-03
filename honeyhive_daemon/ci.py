@@ -13,7 +13,7 @@ from typing import Optional
 import click
 import httpx
 
-from .config import DEFAULT_BASE_URL, find_project_root, load_project_config
+from .config import DEFAULT_BASE_URL, find_project_root
 from .error_categories import categorize, load_rules
 
 
@@ -44,11 +44,11 @@ def _parse_since_ms(since: str) -> int:
     return int((datetime.now(timezone.utc).timestamp() - n * seconds) * 1000)
 
 
-def _query(url: str, key: str, project: str, filters: list, limit: int = 500) -> list:
+def _query(url: str, key: str, filters: list, limit: int = 500) -> list:
     resp = httpx.post(
         f"{url.rstrip('/')}/v1/events/export",
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={"project": project, "filters": filters, "limit": limit},
+        json={"filters": filters, "limit": limit},
         timeout=30.0,
     )
     resp.raise_for_status()
@@ -226,7 +226,7 @@ def _detect_loop_patterns(error_events: list) -> list:
     return sorted(patterns, key=lambda p: p["occurrences"], reverse=True)
 
 
-def _detect_evaluator_patterns(url: str, key: str, project: str, since_ms: int) -> list:
+def _detect_evaluator_patterns(url: str, key: str, since_ms: int) -> list:
     """Query evaluator results and surface data-leakage and adherence failures.
 
     Looks for two evaluator metric names created by ``push-evaluators``:
@@ -237,16 +237,16 @@ def _detect_evaluator_patterns(url: str, key: str, project: str, since_ms: int) 
     Gracefully handles API errors (HH may not support nested metric filters
     on all deployments).
     """
-    from .evaluators import _safe_project_slug  # avoid circular at module level
+    from .evaluators import _repo_slug
 
-    slug = _safe_project_slug(project)
+    slug = _repo_slug()
     leakage_metric = f"Sensitive Data Leakage - {slug}"
     adherence_metric = f"Instruction Adherence - {slug}"
     patterns: list[dict] = []
 
     # ----- Data leakage -----
     try:
-        leak_events = _query(url, key, project, filters=[
+        leak_events = _query(url, key, filters=[
             {"field": f"metrics.{leakage_metric}", "operator": "contains",
              "value": "LEAK", "type": "string"},
             {"field": "start_time", "operator": ">=", "type": "number", "value": since_ms},
@@ -291,7 +291,7 @@ def _detect_evaluator_patterns(url: str, key: str, project: str, since_ms: int) 
 
     # ----- Adherence failures -----
     try:
-        low_adherence = _query(url, key, project, filters=[
+        low_adherence = _query(url, key, filters=[
             {"field": f"metrics.{adherence_metric}", "operator": "less than",
              "value": 2, "type": "number"},
             {"field": "start_time", "operator": ">=", "type": "number", "value": since_ms},
@@ -384,8 +384,7 @@ jobs:
           HH_API_KEY: ${{ secrets.HH_API_KEY }}
           HH_API_URL: ${{ vars.HH_API_URL }}
         run: |
-          honeyhive-daemon push-evaluators \\
-            --project '__PROJECT__'
+          honeyhive-daemon push-evaluators
           # Idempotent — safe to run on every CI pass.
           # Updates the CLAUDE.md adherence evaluator if the file changed.
 
@@ -396,7 +395,6 @@ jobs:
           HH_API_URL: ${{ vars.HH_API_URL }}
         run: |
           honeyhive-daemon analyze \\
-            --project __PROJECT__ \\
             --since "${{ github.event.inputs.since || '24h' }}" \\
             --out /tmp/hh-patterns.json
           echo "=== patterns detected ==="
@@ -502,34 +500,9 @@ jobs:
 """
 
 
-_PROJECT_SAFE_RE = re.compile(r"[^a-zA-Z0-9_\-.]")
-
-
-def _validate_project_for_yaml(project: str) -> None:
-    """Raise ClickException if the project name is unsafe to embed in shell commands.
-
-    Project names with spaces or shell metacharacters would produce broken YAML
-    without additional quoting. Reject early with a clear error rather than
-    silently generating a broken workflow file.
-    """
-    if _PROJECT_SAFE_RE.search(project):
-        raise click.ClickException(
-            f"Project name {project!r} contains characters that are unsafe in shell "
-            "commands. Use only letters, digits, hyphens, underscores, and dots.\n"
-            "Rename the project with 'honeyhive-daemon init --project safe-name'."
-        )
-
-
-def generate_workflow(project: str, cadence: str) -> str:
-    _validate_project_for_yaml(project)
+def generate_workflow(cadence: str) -> str:
     cron = CADENCES[cadence]
-    # Substitute __PROJECT__ before __CRON__ to prevent any cross-contamination
-    # if the project name somehow contained the __CRON__ token.
-    return (
-        _WORKFLOW_TEMPLATE
-        .replace("__PROJECT__", project, )
-        .replace("__CRON__", cron)
-    )
+    return _WORKFLOW_TEMPLATE.replace("__CRON__", cron)
 
 
 # ---------------------------------------------------------------------------
@@ -537,12 +510,6 @@ def generate_workflow(project: str, cadence: str) -> str:
 # ---------------------------------------------------------------------------
 
 @click.command("analyze")
-@click.option(
-    "--project", "-p",
-    envvar="HH_PROJECT",
-    default=None,
-    help="HoneyHive project name (falls back to .honeyhive/config.json).",
-)
 @click.option(
     "--since",
     default="24h",
@@ -569,7 +536,6 @@ def generate_workflow(project: str, cadence: str) -> str:
     help="HoneyHive API key.",
 )
 def analyze_cmd(
-    project: Optional[str],
     since: str,
     out: str,
     url: str,
@@ -585,19 +551,8 @@ def analyze_cmd(
 
       honeyhive-daemon analyze --since 24h
 
-      honeyhive-daemon analyze --project my-project --since 7d --out patterns.json
+      honeyhive-daemon analyze --since 7d --out patterns.json
     """
-    # Resolve project from .honeyhive/config.json if not provided
-    if not project:
-        root = find_project_root(str(Path.cwd()))
-        if root:
-            cfg = load_project_config(root)
-            project = cfg.get("project")
-    if not project:
-        raise click.UsageError(
-            "No project found. Pass --project or run 'honeyhive-daemon init' first."
-        )
-
     if not key:
         raise click.UsageError(
             "No API key found. Set HH_API_KEY or pass --key."
@@ -608,7 +563,7 @@ def analyze_cmd(
     # Load per-repo error category config (falls back to built-in defaults).
     categories, skip_patterns = load_rules(str(Path.cwd()))
 
-    click.echo(f"Querying project '{project}' for the last {since}…", err=True)
+    click.echo(f"Querying API-key scope for the last {since}…", err=True)
 
     # Query failed tool events.
     # Bug fix: use an explicit flag to distinguish "query succeeded with 0 results"
@@ -617,7 +572,7 @@ def analyze_cmd(
     first_query_ok = False
     failure_events: list = []
     try:
-        failure_events = _query(url, key, project, filters=[
+        failure_events = _query(url, key, filters=[
             {"field": "metadata.tool.status", "operator": "is",  "type": "string", "value": "failure"},
             {"field": "start_time",           "operator": ">=",  "type": "number", "value": since_ms},
         ])
@@ -627,7 +582,7 @@ def analyze_cmd(
 
     errfield_events: list = []
     try:
-        errfield_events = _query(url, key, project, filters=[
+        errfield_events = _query(url, key, filters=[
             {"field": "error",      "operator": "is not null", "type": "string"},
             {"field": "start_time", "operator": ">=",          "type": "number", "value": since_ms},
         ])
@@ -651,7 +606,7 @@ def analyze_cmd(
 
     # Query session count
     try:
-        session_events = _query(url, key, project, filters=[
+        session_events = _query(url, key, filters=[
             {"field": "event_type", "operator": "is",          "type": "string", "value": "session"},
             {"field": "event_name", "operator": "is",          "type": "string", "value": "session.start"},
             {"field": "start_time", "operator": ">=",          "type": "number", "value": since_ms},
@@ -669,7 +624,7 @@ def analyze_cmd(
 
     # Detect evaluator-based patterns (data leakage + adherence failures).
     # These are additive — if evaluators haven't been pushed yet they return [].
-    evaluator_patterns = _detect_evaluator_patterns(url, key, project, since_ms)
+    evaluator_patterns = _detect_evaluator_patterns(url, key, since_ms)
     patterns.extend(evaluator_patterns)
     patterns.sort(key=lambda p: p["occurrences"], reverse=True)
 
@@ -684,7 +639,6 @@ def analyze_cmd(
 
     report = {
         "analyzed_at": datetime.now(timezone.utc).isoformat(),
-        "project": project,
         "window": since,
         "session_count": session_count,
         "error_event_count": len(error_events),
@@ -709,12 +663,6 @@ def analyze_cmd(
     help="How often the workflow should run.",
 )
 @click.option(
-    "--project", "-p",
-    envvar="HH_PROJECT",
-    default=None,
-    help="HoneyHive project name (falls back to .honeyhive/config.json).",
-)
-@click.option(
     "--output-dir",
     default=None,
     type=click.Path(file_okay=False, path_type=Path),
@@ -722,7 +670,6 @@ def analyze_cmd(
 )
 def add_to_ci_cmd(
     cadence: str,
-    project: Optional[str],
     output_dir: Optional[Path],
 ) -> None:
     """Add a GitHub Actions workflow for proactive Claude Code improvements.
@@ -742,20 +689,9 @@ def add_to_ci_cmd(
 
       honeyhive-daemon add-to-ci
 
-      honeyhive-daemon add-to-ci --cadence weekly --project my-project
+      honeyhive-daemon add-to-ci --cadence weekly
     """
     cwd = Path.cwd()
-
-    # Resolve project
-    if not project:
-        root = find_project_root(str(cwd))
-        if root:
-            cfg = load_project_config(root)
-            project = cfg.get("project")
-    if not project:
-        raise click.UsageError(
-            "No project found. Pass --project or run 'honeyhive-daemon init' first."
-        )
 
     # Resolve output path
     workflows_dir = output_dir or (cwd / ".github" / "workflows")
@@ -763,7 +699,7 @@ def add_to_ci_cmd(
     workflow_path = workflows_dir / "hh-proactive-improvements.yml"
 
     already_existed = workflow_path.exists()
-    yaml_content = generate_workflow(project, cadence)
+    yaml_content = generate_workflow(cadence)
     workflow_path.write_text(yaml_content, encoding="utf-8")
 
     # Scaffold per-repo error categories config if it doesn't exist yet.
@@ -792,7 +728,6 @@ def add_to_ci_cmd(
         pass
     click.echo("")
     click.echo("  Workflow:  HoneyHive Proactive Improvements")
-    click.echo(f"  Project:   {project}")
     click.echo(f"  Cadence:   {cadence}  (cron: {cron})")
     click.echo(f"  Trigger:   schedule + workflow_dispatch (manual run any time)")
     click.echo("")

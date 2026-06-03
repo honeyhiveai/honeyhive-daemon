@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-DEFAULT_BASE_URL = "https://api.honeyhive.ai"
+DEFAULT_BASE_URL = "https://api.dp1.us.prod.honeyhive.ai"
 
 
 @dataclass
@@ -20,7 +20,6 @@ class DaemonConfig:
 
     api_key: str
     base_url: str
-    project: str
     repo_path: Optional[str] = None
     ci: bool = False
 
@@ -34,7 +33,6 @@ class DaemonConfig:
         return cls(
             api_key=str(data["api_key"]),
             base_url=str(data.get("base_url") or DEFAULT_BASE_URL),
-            project=str(data["project"]),
             repo_path=data.get("repo_path"),
             ci=bool(data.get("ci", False)),
         )
@@ -136,7 +134,7 @@ def load_routes() -> list:
 
         {
           "routes": [
-            {"cwd_prefix": "/path/to/project", "project": "my_project", "api_key_env": "MY_KEY"},
+            {"cwd_prefix": "/path/to/project", "api_key_env": "MY_KEY"},
             ...
           ]
         }
@@ -162,7 +160,7 @@ def resolve_config_for_cwd(
 ) -> DaemonConfig:
     """Resolve the DaemonConfig for a given cwd using routing rules.
 
-    If a route matches, override project and api_key from the route.
+    If a route matches, override api_key (and optionally base_url) from the route.
     Falls back to default_config if no route matches.
     """
     if not cwd:
@@ -180,7 +178,6 @@ def resolve_config_for_cwd(
             return DaemonConfig(
                 api_key=api_key,
                 base_url=route.get("api_url", default_config.base_url),
-                project=route.get("project", default_config.project),
                 repo_path=default_config.repo_path,
                 ci=default_config.ci,
             )
@@ -257,11 +254,8 @@ def save_user_config(data: dict) -> Path:
 def load_project_config(project_root: Path) -> dict:
     """Load project-level config from ``{project_root}/.honeyhive/config.json``.
 
-    Expected schema::
-
-        {"project": "my-project"}
-
     Returns an empty dict on missing file or parse error.
+    Legacy ``project`` keys are ignored (scope comes from the API key).
     """
     path = project_root / ".honeyhive" / "config.json"
     try:
@@ -346,14 +340,12 @@ def _merge_to_daemon_config(merged: dict, cli_defaults: Optional[DaemonConfig]) 
         api_key = ""
 
     base_url = merged.get("base_url") or (cli_defaults.base_url if cli_defaults else DEFAULT_BASE_URL)
-    project = merged.get("project") or (cli_defaults.project if cli_defaults else "")
     repo_path = merged.get("repo_path") or (cli_defaults.repo_path if cli_defaults else None)
     ci = merged.get("ci", cli_defaults.ci if cli_defaults else False)
 
     return DaemonConfig(
         api_key=api_key,
         base_url=base_url,
-        project=project,
         repo_path=repo_path,
         ci=ci,
     )
@@ -456,7 +448,7 @@ def resolve_config(
         merged.update(load_project_local_config(project_root))
     elif cwd:
         # No .honeyhive/ found — fall back to routes.json
-        fallback_base = cli_defaults or DaemonConfig(api_key="", base_url=DEFAULT_BASE_URL, project="")
+        fallback_base = cli_defaults or DaemonConfig(api_key="", base_url=DEFAULT_BASE_URL)
         routes_config = resolve_config_for_cwd(fallback_base, cwd)
         if routes_config is not fallback_base:
             # routes.json matched — use it as the base and overlay session
@@ -466,7 +458,6 @@ def resolve_config(
                     result = DaemonConfig(
                         api_key=routes_config.api_key,
                         base_url=session_layer.get("base_url", routes_config.base_url),
-                        project=session_layer.get("project", routes_config.project),
                         repo_path=routes_config.repo_path,
                         ci=routes_config.ci,
                     )

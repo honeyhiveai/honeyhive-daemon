@@ -408,12 +408,12 @@ event_mappings:
         instructions.load_reason: load_reason
         instructions.memory_type: memory_type
         instructions.trigger_file_path: trigger_file_path
-    inputs:
-      from_payload:
-        globs: globs
+        instructions.parent_file_path: parent_file_path
+        instructions.globs: globs
+    inputs: {}
 
   UserPromptSubmit:
-    event_type: model
+    event_type: chain
     event_name: turn.user
     event_id_strategy: uuid4
     parent_id_strategy: session_root

@@ -105,10 +105,10 @@ class TestLoadProjectConfig:
         hh_dir = tmp_path / ".honeyhive"
         hh_dir.mkdir()
         (hh_dir / "config.json").write_text(
-            json.dumps({"project": "my-project"}), encoding="utf-8"
+            json.dumps({"base_url": "https://custom.api"}), encoding="utf-8"
         )
         result = load_project_config(tmp_path)
-        assert result["project"] == "my-project"
+        assert result["base_url"] == "https://custom.api"
 
     def test_returns_empty_when_missing(self, tmp_path: Path) -> None:
         assert load_project_config(tmp_path) == {}
@@ -227,14 +227,11 @@ class TestResolveConfig:
         project_root = self._setup_layers(
             tmp_path,
             monkeypatch,
-            user={"project": "user-proj", "base_url": "https://user.api"},
-            project={"project": "proj-proj"},
+            user={"base_url": "https://user.api"},
+            project={"base_url": "https://proj.api"},
         )
         result = resolve_config(cwd=str(project_root))
-        # Project config overrides user config
-        assert result.project == "proj-proj"
-        # User base_url survives if project doesn't set it
-        assert result.base_url == "https://user.api"
+        assert result.base_url == "https://proj.api"
 
     def test_project_local_overrides_project(
         self, tmp_path: Path, monkeypatch
@@ -244,11 +241,14 @@ class TestResolveConfig:
             tmp_path,
             monkeypatch,
             user={"api_key_env": "WRONG_KEY"},
-            project={"project": "proj-proj"},
-            project_local={"api_key_env": "LOCAL_KEY", "project": "local-proj"},
+            project={"base_url": "https://proj.api"},
+            project_local={
+                "api_key_env": "LOCAL_KEY",
+                "base_url": "https://local.api",
+            },
         )
         result = resolve_config(cwd=str(project_root))
-        assert result.project == "local-proj"
+        assert result.base_url == "https://local.api"
         assert result.api_key == "local-secret"
 
     def test_session_overrides_all(
@@ -258,15 +258,15 @@ class TestResolveConfig:
         project_root = self._setup_layers(
             tmp_path,
             monkeypatch,
-            user={"project": "user-proj"},
-            project={"project": "proj-proj"},
-            project_local={"project": "local-proj"},
-            session={"project": "session-proj"},
+            user={"base_url": "https://user.api"},
+            project={"base_url": "https://proj.api"},
+            project_local={"base_url": "https://local.api"},
+            session={"base_url": "https://session.api"},
         )
         result = resolve_config(
             cwd=str(project_root), session_name="test-session"
         )
-        assert result.project == "session-proj"
+        assert result.base_url == "https://session.api"
 
     def test_cli_defaults_used_as_fallback(
         self, tmp_path: Path, monkeypatch
@@ -276,16 +276,15 @@ class TestResolveConfig:
             tmp_path,
             monkeypatch,
             user={},
-            project={"project": "my-proj"},
+            project={"base_url": "https://proj.api"},
         )
         cli = DaemonConfig(
             api_key="cli-key",
             base_url="https://cli.api",
-            project="cli-proj",
         )
         result = resolve_config(cwd=str(project_root), cli_defaults=cli)
-        assert result.project == "my-proj"  # project config wins
-        assert result.api_key == "cli-key"  # falls back to cli
+        assert result.base_url == "https://proj.api"
+        assert result.api_key == "cli-key"
 
     def test_missing_cwd_falls_back_to_cli_defaults(
         self, tmp_path: Path, monkeypatch
@@ -301,11 +300,10 @@ class TestResolveConfig:
         cli = DaemonConfig(
             api_key="fallback-key",
             base_url="https://fallback.api",
-            project="fallback-proj",
         )
         result = resolve_config(cwd=None, cli_defaults=cli)
         assert result.api_key == "fallback-key"
-        assert result.project == "fallback-proj"
+        assert result.base_url == "https://fallback.api"
 
     def test_empty_layers_produce_empty_config(
         self, tmp_path: Path, monkeypatch
@@ -320,7 +318,6 @@ class TestResolveConfig:
         monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon"))
         result = resolve_config(cwd=None, cli_defaults=None)
         assert result.api_key == ""
-        assert result.project == ""
         assert result.base_url == DEFAULT_BASE_URL
 
 
@@ -361,7 +358,7 @@ class TestRoutesJsonBackwardCompat:
                     "routes": [
                         {
                             "cwd_prefix": str(tmp_path / "myrepo"),
-                            "project": "routed-project",
+                            "api_url": "https://routed.api",
                             "api_key_env": "ROUTE_KEY",
                         }
                     ]
@@ -378,10 +375,9 @@ class TestRoutesJsonBackwardCompat:
         cli = DaemonConfig(
             api_key="cli-key",
             base_url=DEFAULT_BASE_URL,
-            project="cli-proj",
         )
         result = resolve_config(cwd=str(work_dir), cli_defaults=cli)
-        assert result.project == "routed-project"
+        assert result.base_url == "https://routed.api"
         assert result.api_key == "route-secret"
 
     def test_hierarchical_config_takes_precedence_over_routes(
@@ -408,7 +404,7 @@ class TestRoutesJsonBackwardCompat:
                     "routes": [
                         {
                             "cwd_prefix": str(tmp_path / "myrepo"),
-                            "project": "routed-project",
+                            "api_url": "https://routed.api",
                         }
                     ]
                 }
@@ -422,17 +418,15 @@ class TestRoutesJsonBackwardCompat:
         hh_dir = project_root / ".honeyhive"
         hh_dir.mkdir()
         (hh_dir / "config.json").write_text(
-            json.dumps({"project": "hierarchical-project"}), encoding="utf-8"
+            json.dumps({"base_url": "https://hierarchical.api"}), encoding="utf-8"
         )
 
         cli = DaemonConfig(
             api_key="cli-key",
             base_url=DEFAULT_BASE_URL,
-            project="cli-proj",
         )
         result = resolve_config(cwd=str(project_root), cli_defaults=cli)
-        # .honeyhive/ wins over routes.json
-        assert result.project == "hierarchical-project"
+        assert result.base_url == "https://hierarchical.api"
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +439,6 @@ class TestSpoolStamping:
         config = DaemonConfig(
             api_key="key-1",
             base_url="https://api.example.com",
-            project="my-project",
             repo_path="/tmp/repo",
             ci=True,
         )
@@ -453,17 +446,16 @@ class TestSpoolStamping:
         restored = DaemonConfig.from_dict(d)
         assert restored.api_key == config.api_key
         assert restored.base_url == config.base_url
-        assert restored.project == config.project
         assert restored.repo_path == config.repo_path
         assert restored.ci == config.ci
 
     def test_from_dict_uses_default_base_url(self) -> None:
-        d = {"api_key": "k", "project": "p"}
+        d = {"api_key": "k"}
         config = DaemonConfig.from_dict(d)
         assert config.base_url == DEFAULT_BASE_URL
 
     def test_from_dict_handles_none_base_url(self) -> None:
-        d = {"api_key": "k", "project": "p", "base_url": None}
+        d = {"api_key": "k", "base_url": None}
         config = DaemonConfig.from_dict(d)
         assert config.base_url == DEFAULT_BASE_URL
 
@@ -482,7 +474,7 @@ class TestCacheInvalidation:
         user_config_path = tmp_path / "home" / ".honeyhive" / "config.json"
         user_config_path.parent.mkdir(parents=True)
         user_config_path.write_text(
-            json.dumps({"project": "cached-proj"}), encoding="utf-8"
+            json.dumps({"base_url": "https://cached.api"}), encoding="utf-8"
         )
         monkeypatch.setattr(
             "honeyhive_daemon.config._get_user_config_path",
@@ -503,7 +495,7 @@ class TestCacheInvalidation:
         user_config_path = tmp_path / "home" / ".honeyhive" / "config.json"
         user_config_path.parent.mkdir(parents=True)
         user_config_path.write_text(
-            json.dumps({"project": "before"}), encoding="utf-8"
+            json.dumps({"base_url": "https://before.api"}), encoding="utf-8"
         )
         monkeypatch.setattr(
             "honeyhive_daemon.config._get_user_config_path",
@@ -512,15 +504,14 @@ class TestCacheInvalidation:
         monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon"))
 
         r1 = resolve_config(cwd=None)
-        assert r1.project == "before"
+        assert r1.base_url == "https://before.api"
 
-        # Update file content (but mtime may be same within 1s)
         user_config_path.write_text(
-            json.dumps({"project": "after"}), encoding="utf-8"
+            json.dumps({"base_url": "https://after.api"}), encoding="utf-8"
         )
         invalidate_config_cache()
         r2 = resolve_config(cwd=None)
-        assert r2.project == "after"
+        assert r2.base_url == "https://after.api"
 
     def test_mtime_change_invalidates_cache(
         self, tmp_path: Path, monkeypatch
@@ -530,7 +521,7 @@ class TestCacheInvalidation:
         user_config_path = tmp_path / "home" / ".honeyhive" / "config.json"
         user_config_path.parent.mkdir(parents=True)
         user_config_path.write_text(
-            json.dumps({"project": "v1"}), encoding="utf-8"
+            json.dumps({"base_url": "https://v1.api"}), encoding="utf-8"
         )
         monkeypatch.setattr(
             "honeyhive_daemon.config._get_user_config_path",
@@ -539,20 +530,18 @@ class TestCacheInvalidation:
         monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon"))
 
         r1 = resolve_config(cwd=None)
-        assert r1.project == "v1"
+        assert r1.base_url == "https://v1.api"
 
-        # Change content and force mtime to change
         import time
 
         user_config_path.write_text(
-            json.dumps({"project": "v2"}), encoding="utf-8"
+            json.dumps({"base_url": "https://v2.api"}), encoding="utf-8"
         )
-        # Force different mtime by setting it to future
         future_mtime = time.time() + 100
         os.utime(user_config_path, (future_mtime, future_mtime))
 
         r2 = resolve_config(cwd=None)
-        assert r2.project == "v2"
+        assert r2.base_url == "https://v2.api"
         assert r2 is not r1
 
 
@@ -567,27 +556,25 @@ class TestMergeToDaemonConfig:
         merged = {
             "api_key_env": "SOME_ENV",
             "_resolved_api_key": "resolved-key",
-            "project": "p",
         }
         result = _merge_to_daemon_config(merged, None)
         assert result.api_key == "resolved-key"
 
     def test_api_key_env_fallback(self, monkeypatch) -> None:
         monkeypatch.setenv("SOME_ENV", "env-key")
-        merged = {"api_key_env": "SOME_ENV", "project": "p"}
+        merged = {"api_key_env": "SOME_ENV"}
         result = _merge_to_daemon_config(merged, None)
         assert result.api_key == "env-key"
 
     def test_cli_defaults_fallback_for_api_key(self) -> None:
-        cli = DaemonConfig(api_key="cli-key", base_url=DEFAULT_BASE_URL, project="p")
-        merged = {"project": "p"}
+        cli = DaemonConfig(api_key="cli-key", base_url=DEFAULT_BASE_URL)
+        merged = {}
         result = _merge_to_daemon_config(merged, cli)
         assert result.api_key == "cli-key"
 
     def test_empty_merged_no_defaults(self) -> None:
         result = _merge_to_daemon_config({}, None)
         assert result.api_key == ""
-        assert result.project == ""
         assert result.base_url == DEFAULT_BASE_URL
 
 

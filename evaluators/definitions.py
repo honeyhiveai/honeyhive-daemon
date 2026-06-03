@@ -15,7 +15,7 @@ Claude Code (PascalCase: Bash, Read, Write) and other frameworks
 # ---------------------------------------------------------------------------
 
 _TOOL_NORMALIZER = """
-def _normalize_tool(name):
+def normalize_tool(name):
     \"\"\"Map tool event names to canonical categories.\"\"\"
     if not name or not name.startswith("tool."):
         return None
@@ -46,7 +46,7 @@ def _normalize_tool(name):
         return "mcp"
     return "other"
 
-def _extract_events_from_artifact(event):
+def extract_events_from_artifact(event):
     \"\"\"Extract event-like records from session artifact transcript.\"\"\"
     outputs = event.get("outputs") or {}
     artifact = outputs.get("artifact") or {}
@@ -54,6 +54,62 @@ def _extract_events_from_artifact(event):
     if not isinstance(content, list):
         return []
     return content
+
+def tool_calls_from_record(record):
+    \"\"\"Return one call per tool invocation in raw or normalized records.\"\"\"
+    ename = record.get("event_name", "")
+    if ename.startswith("tool."):
+        return [{
+            "name": ename[5:],
+            "input": record.get("tool_input") or record.get("input") or {},
+        }]
+
+    etype = record.get("type", "")
+    tool_name = record.get("tool_name") or record.get("toolName") or record.get("name")
+    if etype in ("tool_use", "tool_result") and tool_name:
+        return [{
+            "name": str(tool_name),
+            "input": record.get("tool_input") or record.get("input") or {},
+        }]
+
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+
+    calls = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            calls.append({
+                "name": str(block.get("name") or "other"),
+                "input": block.get("input") or {},
+            })
+    return calls
+
+def tool_names_from_record(record):
+    \"\"\"Return one tool name per tool invocation in raw or normalized records.\"\"\"
+    return [call["name"] for call in tool_calls_from_record(record)]
+
+def record_is_tool(record):
+    \"\"\"True when the record represents at least one tool event.\"\"\"
+    if record.get("event_name", "").startswith("tool."):
+        return True
+    if record.get("type", "") in ("tool_use", "tool_result"):
+        return True
+    return bool(tool_names_from_record(record))
+
+def record_is_model(record):
+    \"\"\"True when the record represents model/user turn activity.\"\"\"
+    ename = record.get("event_name", "")
+    hook = record.get("hook_event_name", "")
+    if ename.startswith("turn.") or hook in ("UserPromptSubmit", "Stop"):
+        return True
+    if record.get("type", "") in ("text", "thinking", "assistant"):
+        return True
+    message = record.get("message")
+    return isinstance(message, dict) and message.get("role") == "assistant"
 """
 
 # ---------------------------------------------------------------------------
@@ -64,23 +120,25 @@ def _extract_events_from_artifact(event):
 
 CRITERIA_BASH_RATIO = _TOOL_NORMALIZER + """
 def evaluate(event):
-    records = _extract_events_from_artifact(event)
+    records = extract_events_from_artifact(event)
     tool_count = 0
     bash_count = 0
     for r in records:
         if not isinstance(r, dict):
             continue
-        etype = r.get("type", "")
-        ename = r.get("event_name", "")
-        tool_name = r.get("tool_name") or r.get("toolName") or ""
-        if etype == "tool_use" or etype == "tool_result" or ename.startswith("tool."):
+        names = tool_names_from_record(r)
+        if names:
+            for tool_name in names:
+                tool_count += 1
+                if normalize_tool("tool." + tool_name) == "bash":
+                    bash_count += 1
+        elif record_is_tool(r):
             tool_count += 1
-            cat = _normalize_tool("tool." + tool_name) if tool_name else _normalize_tool(ename)
-            if cat == "bash":
-                bash_count += 1
     if tool_count == 0:
         return 0.0
     return round(bash_count / tool_count, 3)
+
+result = evaluate(event)
 """
 
 # ---------------------------------------------------------------------------
@@ -93,21 +151,23 @@ CRITERIA_BASH_EDIT_MISUSE = _TOOL_NORMALIZER + """
 import re
 
 def evaluate(event):
-    records = _extract_events_from_artifact(event)
+    records = extract_events_from_artifact(event)
     edit_tool_count = 0
     bash_edit_count = 0
     for r in records:
         if not isinstance(r, dict):
             continue
-        etype = r.get("type", "")
-        ename = r.get("event_name", "")
-        tool_name = r.get("tool_name") or r.get("toolName") or ""
-        cat = _normalize_tool("tool." + tool_name) if tool_name else _normalize_tool(ename)
-        if cat == "file_edit":
+        calls = tool_calls_from_record(r)
+        categories = [normalize_tool("tool." + call["name"]) for call in calls]
+        if not categories and record_is_tool(r):
+            categories = [normalize_tool(r.get("event_name", ""))]
+        if "file_edit" in categories:
             edit_tool_count += 1
-        if cat == "bash":
+        for call, category in zip(calls, categories):
+            if category != "bash":
+                continue
             cmd = ""
-            tool_input = r.get("tool_input") or r.get("input") or {}
+            tool_input = call.get("input") or {}
             if isinstance(tool_input, dict):
                 cmd = str(tool_input.get("command", ""))
             elif isinstance(tool_input, str):
@@ -118,6 +178,8 @@ def evaluate(event):
     if total_edits == 0:
         return 0.0
     return round(bash_edit_count / total_edits, 3)
+
+result = evaluate(event)
 """
 
 # ---------------------------------------------------------------------------
@@ -126,23 +188,25 @@ def evaluate(event):
 
 CRITERIA_FILE_SEARCH_SPAM = _TOOL_NORMALIZER + """
 def evaluate(event):
-    records = _extract_events_from_artifact(event)
+    records = extract_events_from_artifact(event)
     tool_count = 0
     search_count = 0
     for r in records:
         if not isinstance(r, dict):
             continue
-        etype = r.get("type", "")
-        ename = r.get("event_name", "")
-        tool_name = r.get("tool_name") or r.get("toolName") or ""
-        if etype == "tool_use" or etype == "tool_result" or ename.startswith("tool."):
+        names = tool_names_from_record(r)
+        if names:
+            for tool_name in names:
+                tool_count += 1
+                if normalize_tool("tool." + tool_name) == "file_search":
+                    search_count += 1
+        elif record_is_tool(r):
             tool_count += 1
-            cat = _normalize_tool("tool." + tool_name) if tool_name else _normalize_tool(ename)
-            if cat == "file_search":
-                search_count += 1
     if tool_count == 0:
         return 0.0
     return round(search_count / tool_count, 3)
+
+result = evaluate(event)
 """
 
 # ---------------------------------------------------------------------------
@@ -151,7 +215,7 @@ def evaluate(event):
 
 CRITERIA_PERMISSION_BOTTLENECK = _TOOL_NORMALIZER + """
 def evaluate(event):
-    records = _extract_events_from_artifact(event)
+    records = extract_events_from_artifact(event)
     total = 0
     permission_count = 0
     for r in records:
@@ -172,6 +236,8 @@ def evaluate(event):
     if total == 0:
         return 0.0
     return round(permission_count / total, 3)
+
+result = evaluate(event)
 """
 
 # ---------------------------------------------------------------------------
@@ -200,6 +266,8 @@ def evaluate(event):
     if starts == 0:
         return True
     return starts == stops
+
+result = evaluate(event)
 """
 
 # ---------------------------------------------------------------------------
@@ -214,6 +282,8 @@ def evaluate(event):
     if not isinstance(content, list):
         return 0.0
     return float(len(content))
+
+result = evaluate(event)
 """
 
 # ---------------------------------------------------------------------------
@@ -222,22 +292,24 @@ def evaluate(event):
 
 CRITERIA_TOOL_MODEL_RATIO = _TOOL_NORMALIZER + """
 def evaluate(event):
-    records = _extract_events_from_artifact(event)
+    records = extract_events_from_artifact(event)
     tool_count = 0
     model_count = 0
     for r in records:
         if not isinstance(r, dict):
             continue
-        etype = r.get("type", "")
-        ename = r.get("event_name", "")
-        hook = r.get("hook_event_name", "")
-        if etype in ("tool_use", "tool_result") or ename.startswith("tool."):
+        names = tool_names_from_record(r)
+        if names:
+            tool_count += len(names)
+        elif record_is_tool(r):
             tool_count += 1
-        elif etype in ("text", "thinking") or ename.startswith("turn.") or hook in ("UserPromptSubmit", "Stop"):
+        if record_is_model(r):
             model_count += 1
     if model_count == 0:
         return 0.0 if tool_count == 0 else float(tool_count)
     return round(tool_count / model_count, 2)
+
+result = evaluate(event)
 """
 
 # ---------------------------------------------------------------------------
@@ -246,8 +318,12 @@ def evaluate(event):
 
 LLM_TASK_COMPLETION = """You are evaluating whether a coding AI agent successfully completed the user's task.
 
-Review the conversation between the user and the AI coding agent below:
+Review the conversation between the user and the AI coding agent below.
 
+Initial user message:
+{{ inputs.chat_history }}
+
+Conversation continuation:
 {{ outputs.chat_history }}
 
 Evaluate whether the agent accomplished what the user asked for. Consider:
@@ -292,99 +368,6 @@ Rate the approach efficiency on a scale of 1-5:
 
 Your rating: [[X]]"""
 
-
-# ---------------------------------------------------------------------------
-# 9. Waggle Skill Success — did the skill session complete without errors?
-# ---------------------------------------------------------------------------
-# Checks sessions named "waggle-*" for completion signals:
-# - Has a session.end event (clean exit)
-# - No errors in tool results
-# - Not stuck (event count within bounds)
-# - Produced output (non-empty outputs on session.end artifact)
-
-CRITERIA_WAGGLE_SKILL_SUCCESS = _TOOL_NORMALIZER + """
-def evaluate(event):
-    records = _extract_events_from_artifact(event)
-    if not records:
-        return 0.0
-
-    # Check for session metadata
-    metadata = event.get("metadata") or {}
-    session_name = metadata.get("session.name", "") or ""
-
-    has_session_end = False
-    error_count = 0
-    total_events = len(records)
-    tool_errors = 0
-    total_tools = 0
-
-    for r in records:
-        if not isinstance(r, dict):
-            continue
-        etype = r.get("type", "")
-        ename = r.get("event_name", "")
-        hook = r.get("hook_event_name", "")
-
-        # Check for clean session end
-        if ename == "session.end" or hook == "Stop":
-            has_session_end = True
-
-        # Count tool errors
-        if etype == "tool_result":
-            total_tools += 1
-            if r.get("is_error"):
-                tool_errors += 1
-        elif etype == "tool_use":
-            total_tools += 1
-
-    # Scoring: 0.0 to 1.0
-    score = 0.0
-
-    # Clean exit: 0.4 points
-    if has_session_end:
-        score += 0.4
-
-    # Low error rate: 0.3 points
-    if total_tools > 0:
-        error_rate = tool_errors / total_tools
-        if error_rate == 0:
-            score += 0.3
-        elif error_rate < 0.1:
-            score += 0.2
-        elif error_rate < 0.3:
-            score += 0.1
-    else:
-        # No tools used — might be fine for some skills
-        score += 0.15
-
-    # Reasonable session size: 0.3 points
-    # Too short (<3 events) = probably failed to start
-    # Too long (>500 events) = probably stuck
-    if 3 <= total_events <= 500:
-        score += 0.3
-    elif total_events > 500:
-        score += 0.1  # did work but may be stuck
-
-    return round(score, 2)
-"""
-
-# ---------------------------------------------------------------------------
-# 10. Waggle Skill Duration — how long did the skill session take?
-# ---------------------------------------------------------------------------
-
-CRITERIA_WAGGLE_SKILL_DURATION = """
-def evaluate(event):
-    start = event.get("start_time") or 0
-    end = event.get("end_time") or 0
-    if isinstance(start, str):
-        from datetime import datetime
-        start = int(datetime.fromisoformat(start.replace("Z", "+00:00")).timestamp() * 1000)
-    if isinstance(end, str):
-        from datetime import datetime
-        end = int(datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp() * 1000)
-    duration_s = (end - start) / 1000.0
-    return round(max(0, duration_s), 1)
-"""
 
 # ---------------------------------------------------------------------------
 # Registry: all evaluator definitions for programmatic creation
@@ -508,8 +491,8 @@ EVALUATORS = [
         "return_type": "float",
         "scale": 5,
         "threshold": {"min": 3, "max": 5, },
-        "model_provider": "anthropic",
-        "model_name": "claude-sonnet-4-20250514",
+        "model_provider": "openai",
+        "model_name": "gpt-5.4-mini",
         "enabled_in_prod": False,
         "sampling_percentage": 20,
         "filters": {
@@ -527,42 +510,10 @@ EVALUATORS = [
         "return_type": "float",
         "scale": 5,
         "threshold": {"min": 3, "max": 5, },
-        "model_provider": "anthropic",
-        "model_name": "claude-sonnet-4-20250514",
+        "model_provider": "openai",
+        "model_name": "gpt-5.4-mini",
         "enabled_in_prod": False,
         "sampling_percentage": 20,
-        "filters": {
-            "filterArray": [
-                {"field": "event_type", "operator": "is", "value": "chain", "type": "string"},
-                {"field": "event_name", "operator": "is", "value": "session.end", "type": "string"},
-            ]
-        },
-    },
-    {
-        "name": "Waggle Skill - Success Rate",
-        "description": "Composite score (0-1) measuring whether a waggle skill session completed successfully: clean exit, low error rate, reasonable session size. Runs on waggle-* sessions only.",
-        "type": "PYTHON",
-        "criteria": CRITERIA_WAGGLE_SKILL_SUCCESS,
-        "return_type": "float",
-        "scale": 1,
-        "threshold": {"min": 0.7, "max": 1.0, },
-        "enabled_in_prod": True,
-        "filters": {
-            "filterArray": [
-                {"field": "event_type", "operator": "is", "value": "chain", "type": "string"},
-                {"field": "event_name", "operator": "is", "value": "session.end", "type": "string"},
-            ]
-        },
-    },
-    {
-        "name": "Waggle Skill - Duration",
-        "description": "Session duration in seconds. Tracks how long each waggle skill takes to run, useful for identifying slow or stuck skills.",
-        "type": "PYTHON",
-        "criteria": CRITERIA_WAGGLE_SKILL_DURATION,
-        "return_type": "float",
-        "scale": 3600,
-        "threshold": {"min": 1, "max": 600, },
-        "enabled_in_prod": True,
         "filters": {
             "filterArray": [
                 {"field": "event_type", "operator": "is", "value": "chain", "type": "string"},
