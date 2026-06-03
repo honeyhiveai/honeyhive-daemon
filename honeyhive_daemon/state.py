@@ -6,7 +6,7 @@ import fcntl
 import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List
+from typing import Any, Dict, Iterator, List, Optional
 
 from .config import (
     ensure_state_layout,
@@ -254,6 +254,27 @@ def claim_tool_usage_request_id(session_id: str, request_id: str) -> bool:
         session["tool_usage_request_ids"] = sorted(used)
         index[session_id] = session
         return True
+
+
+def split_session_start_chat_history(
+    history: List[Dict[str, str]],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Split accumulated history for session.start: first user message -> inputs, rest -> outputs."""
+    if not history:
+        return {}, {}
+
+    first_user_idx: Optional[int] = None
+    for index, message in enumerate(history):
+        if message.get("role") == "user":
+            first_user_idx = index
+            break
+
+    if first_user_idx is None:
+        return {}, {"chat_history": list(history)}
+
+    initial = history[first_user_idx]
+    rest = history[first_user_idx + 1 :]
+    return {"chat_history": [dict(initial)]}, {"chat_history": list(rest)}
 
 
 def append_chat_history(

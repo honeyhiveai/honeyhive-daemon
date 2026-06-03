@@ -27,6 +27,7 @@ from honeyhive_daemon.main import (
 )
 from honeyhive_daemon.state import (
     append_chat_history,
+    split_session_start_chat_history,
     append_spool_event,
     get_sessions_needing_artifact,
     load_session_index,
@@ -586,6 +587,30 @@ def test_cli_status_shows_spool_failure_reason(
     assert "Connection refused" in result.output
 
 
+def test_split_session_start_chat_history() -> None:
+    assert split_session_start_chat_history([]) == ({}, {})
+    assert split_session_start_chat_history(
+        [{"role": "user", "content": "hi"}]
+    ) == (
+        {"chat_history": [{"role": "user", "content": "hi"}]},
+        {"chat_history": []},
+    )
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "world"},
+        {"role": "user", "content": "again"},
+    ]
+    assert split_session_start_chat_history(history) == (
+        {"chat_history": [{"role": "user", "content": "hi"}]},
+        {
+            "chat_history": [
+                {"role": "assistant", "content": "world"},
+                {"role": "user", "content": "again"},
+            ]
+        },
+    )
+
+
 def test_append_chat_history_includes_current_message(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -601,7 +626,7 @@ def test_append_chat_history_includes_current_message(
     assert len(third) == 3
 
 
-def test_ingest_turn_chat_history_includes_current_message(
+def test_ingest_turn_chat_history_excludes_current_message(
     monkeypatch, tmp_path: Path
 ) -> None:
     from honeyhive_daemon.config import save_config
@@ -652,15 +677,12 @@ def test_ingest_turn_chat_history_includes_current_message(
     assert len(turn_events) == 2
 
     user_event = next(e for e in turn_events if e["event_name"] == "turn.user")
-    assert user_event["inputs"]["chat_history"] == [
-        {"role": "user", "content": "hello"}
-    ]
+    assert user_event["inputs"]["chat_history"] == []
     assert user_event["outputs"]["content"] == "hello"
 
     agent_event = next(e for e in turn_events if e["event_name"] == "turn.agent")
     assert agent_event["inputs"]["chat_history"] == [
         {"role": "user", "content": "hello"},
-        {"role": "assistant", "content": "world"},
     ]
     assert agent_event["outputs"]["content"] == "world"
 
@@ -1022,14 +1044,27 @@ def test_push_pending_session_artifacts_updates_root_event(
         fake_update_event_outputs,
     )
 
-    metrics_captured = []
+    session_start_updates = []
 
     def fake_update_event(  # type: ignore[no-untyped-def]
         config, *, event_id, inputs=None, outputs=None, metadata=None, metrics=None
     ):
-        metrics_captured.append(
-            {"event_id": event_id, "metadata": metadata, "metrics": metrics}
-        )
+        if inputs is not None or outputs is not None:
+            session_start_updates.append(
+                {
+                    "event_id": event_id,
+                    "inputs": inputs,
+                    "outputs": outputs,
+                }
+            )
+        if metrics is not None:
+            session_start_updates.append(
+                {
+                    "event_id": event_id,
+                    "metadata": metadata,
+                    "metrics": metrics,
+                }
+            )
 
     monkeypatch.setattr(
         "honeyhive_daemon.exporter.update_event",
@@ -1040,6 +1075,7 @@ def test_push_pending_session_artifacts_updates_root_event(
     from honeyhive_daemon.state import append_chat_history
 
     append_chat_history("sess-root-1", "user", "hi")
+    append_chat_history("sess-root-1", "assistant", "done")
 
     record_session_activity(
         "sess-root-1",
@@ -1055,22 +1091,32 @@ def test_push_pending_session_artifacts_updates_root_event(
     )
     _push_pending_session_artifacts(config)
 
-    assert [item["event_id"] for item in captured] == ["sess-root-1", "sess-end-1"]
-    assert len(captured) == 2
-    assert captured[0]["outputs"]["chat_history"] == [{"role": "user", "content": "hi"}]
+    assert [item["event_id"] for item in captured] == ["sess-end-1"]
+    assert len(captured) == 1
+    chat_update = next(
+        item
+        for item in session_start_updates
+        if item.get("inputs") is not None or item.get("outputs") is not None
+    )
+    assert chat_update["event_id"] == "sess-root-1"
+    assert chat_update["inputs"] == {
+        "chat_history": [{"role": "user", "content": "hi"}]
+    }
+    assert chat_update["outputs"] == {
+        "chat_history": [{"role": "assistant", "content": "done"}]
+    }
     # End event gets only the full artifact transcript.
-    assert captured[1]["outputs"]["artifact"]["path"] == str(transcript_path)
-    assert captured[1]["outputs"]["artifact"]["content"] == [
+    assert captured[0]["outputs"]["artifact"]["path"] == str(transcript_path)
+    assert captured[0]["outputs"]["artifact"]["content"] == [
         {"type": "user", "message": "hi"}
     ]
-    assert captured[1]["outputs"]["artifact"]["format"] == "json"
-    assert captured[1]["outputs"]["artifact"]["reason"] == "session_end"
-    assert "chat_history" not in captured[1]["outputs"]
-    # Metrics were attached to the root event
-    assert len(metrics_captured) == 1
-    assert metrics_captured[0]["event_id"] == "sess-root-1"
-    assert "coding_agent.event_count" in metrics_captured[0]["metrics"]
-    assert metrics_captured[0]["metadata"] is None
+    assert captured[0]["outputs"]["artifact"]["format"] == "json"
+    assert captured[0]["outputs"]["artifact"]["reason"] == "session_end"
+    assert "chat_history" not in captured[0]["outputs"]
+    metrics_update = next(item for item in session_start_updates if "metrics" in item)
+    assert metrics_update["event_id"] == "sess-root-1"
+    assert "coding_agent.event_count" in metrics_update["metrics"]
+    assert metrics_update["metadata"] is None
 
 
 def test_push_pending_session_artifacts_skips_unended_sessions(

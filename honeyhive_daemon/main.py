@@ -65,6 +65,7 @@ from .state import (
     claim_tool_usage_request_id,
     drain_spool_events,
     get_chat_history,
+    split_session_start_chat_history,
     buffer_pending_tool_event,
     get_expired_tool_events,
     get_sessions_needing_artifact,
@@ -573,16 +574,15 @@ def ingest_claude_hook() -> None:
             pass  # transcript enrichment is best-effort
 
     # Accumulate chat history for turn events.
-    # inputs.chat_history includes the current turn so every turn is inspectable
-    # without reconstructing its own outputs client-side.
+    # inputs.chat_history is prior context only; outputs.content is this turn.
     turn_role = event.get("metadata", {}).get("turn.role")
     if turn_role:
         content = event.get("outputs", {}).get("content")
         if content is not None:
             session_id = str(event["session_id"])
-            event.setdefault("inputs", {})["chat_history"] = append_chat_history(
-                session_id, turn_role, str(content)
-            )
+            prior = get_chat_history(session_id)
+            event.setdefault("inputs", {})["chat_history"] = prior
+            append_chat_history(session_id, turn_role, str(content))
 
     try:
         export_event(config, event)
@@ -859,10 +859,14 @@ def _push_pending_session_artifacts(
         session_end_id = session.get("session_end_event_id")
         try:
             if chat_history:
-                update_event_outputs(
+                session_inputs, session_outputs = split_session_start_chat_history(
+                    chat_history
+                )
+                update_event(
                     session_config,
                     event_id=session_start_id,
-                    outputs={"chat_history": chat_history},
+                    inputs=session_inputs or None,
+                    outputs=session_outputs or None,
                 )
             if session_end_id:
                 update_event_outputs(

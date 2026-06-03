@@ -318,8 +318,12 @@ result = evaluate(event)
 
 LLM_TASK_COMPLETION = """You are evaluating whether a coding AI agent successfully completed the user's task.
 
-Review the conversation between the user and the AI coding agent below:
+Review the conversation between the user and the AI coding agent below.
 
+Initial user message:
+{{ inputs.chat_history }}
+
+Conversation continuation:
 {{ outputs.chat_history }}
 
 Evaluate whether the agent accomplished what the user asked for. Consider:

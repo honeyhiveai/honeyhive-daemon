@@ -73,8 +73,8 @@ Each Claude Code session produces a tree of events in HoneyHive:
 | Event name | Type | Description |
 |------------|------|-------------|
 | `session.start` | `session` | Root event. All other events are children of this. |
-| `turn.user` | `chain` | User prompt. `inputs.chat_history` includes this message; `outputs.content` is this message. |
-| `turn.agent` | `model` | Assistant response. `inputs.chat_history` includes this message; `outputs.content` is this message. |
+| `turn.user` | `chain` | User prompt. `inputs.chat_history` is prior context; `outputs.content` is this message. |
+| `turn.agent` | `model` | Assistant response. `inputs.chat_history` is prior context; `outputs.content` is this message. |
 | `tool.{ToolName}` | `tool` | Tool use (e.g. `tool.Bash`, `tool.Edit`, `tool.Read`, `tool.Grep`). Pre and post hooks are merged into a single event with `start_time`/`end_time` duration. |
 | `chain.instructions.loaded` | `chain` | `CLAUDE.md` or `.claude/rules/*.md` loaded into context ([InstructionsLoaded](https://code.claude.com/docs/en/hooks)). `outputs.content` is read from disk at ingest; metadata has `file.path`, `instructions.memory_type`, `instructions.load_reason`. Does not cover skills or prompt expansion. |
 | `session.end` | `chain` | Marks session completion. |
@@ -86,7 +86,7 @@ Tool events include `inputs.thinking` when a reasoning block precedes the tool c
 
 When a session ends, the daemon pushes final session views:
 
-- **`session.start.outputs.chat_history`** is the user-facing conversation: the back-and-forth of user messages and assistant responses, basically what you'd see in the chat UI. It is filled in after session finalization so the session root is easy to review in HoneyHive.
+- **`session.start.inputs.chat_history`** holds the initial user message; **`session.start.outputs.chat_history`** holds the rest of the user↔agent conversation (assistant replies and follow-up user turns). Both are filled in after session finalization so the session root is easy to review in HoneyHive.
 - **`session.end.outputs.artifact`** contains the full session transcript — this is the complete trajectory of everything that happened under the hood, including tool calls, reasoning/thinking blocks, and internal processing steps. Think of it as the "behind the scenes" view of how the agent actually worked through the task.
 
 This split lets you look at the same session from two angles: the conversation-level view for understanding what the user experienced, and the trajectory-level view for debugging agent behavior and understanding how it got there.
@@ -240,7 +240,7 @@ Unlike the Claude Code daemon (which captures events in real-time via hooks), th
 2. Maps each Devin session to a HoneyHive session event via `POST /session/start`
 3. Fetches session messages and creates child events for each user/agent message
 4. Fetches internal processing events (shell commands, git operations, browser actions, file edits) and exports them as tool/model child events
-5. Updates the session event with `outputs.chat_history` (the full user↔agent conversation) and `outputs.structured_output` when available
+5. Updates the session event with `inputs.chat_history` (initial user message), `outputs.chat_history` (conversation continuation), and `outputs.structured_output` when available
 6. Emits a `session.end` chain event with `outputs.artifact` for completed sessions (status: finished/stopped/failed) — this enables server-side evaluators to run on Devin sessions
 7. On subsequent syncs, updates previously-synced sessions via `PUT /events` and incrementally syncs new messages and internal events
 8. Tracks sync state (last sync timestamp + session ID mapping + message/event counts) in a local JSON file
@@ -355,7 +355,7 @@ Noisy internal events (checkpoints, activity updates, terminal updates) are filt
 
 Emitted when a Devin session reaches `finished`, `stopped`, or `failed` status. Carries `outputs.artifact` with the full conversation as structured content, enabling server-side evaluators to analyze the session.
 
-The session event also receives `outputs.chat_history` — a list of `{"role": "user"|"assistant", "content": "..."}` entries representing the full conversation.
+The session event also receives split chat history: `inputs.chat_history` for the first user message and `outputs.chat_history` for the rest of the `{"role": "user"|"assistant", "content": "..."}` conversation.
 
 ### GitHub Actions Workflow
 
