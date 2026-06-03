@@ -19,7 +19,7 @@ Environment variables:
     DEVIN_ORG_ID        Required for v3 (cog_*) keys (auto-discovered if admin)
     HH_API_KEY          HoneyHive API key
     HH_API_URL          HoneyHive data plane URL
-    HH_PROJECT          HoneyHive project name
+    HH_PROJECT          HoneyHive project name (optional; API key is project-scoped)
     STATE_FILE_PATH     Path to sync state file (default: ./sync_state.json)
 """
 
@@ -427,7 +427,7 @@ class DevinClient:
 
 
 class HoneyHiveClient:
-    def __init__(self, api_key: str, api_url: str, project: str):
+    def __init__(self, api_key: str, api_url: str, project: str = ""):
         self.api_key = api_key
         self.api_url = api_url.rstrip("/")
         self.project = project
@@ -496,12 +496,24 @@ class SyncState:
     ) -> None:
         if "synced_sessions" not in self._state:
             self._state["synced_sessions"] = {}
+        existing = self._state["synced_sessions"].get(devin_session_id, {})
         self._state["synced_sessions"][devin_session_id] = {
             "hh_event_id": hh_event_id,
             "last_updated_epoch": updated_epoch,
             "synced_message_count": message_count,
             "synced_event_count": internal_event_count,
+            "session_end_emitted": existing.get("session_end_emitted", False),
         }
+
+    def is_session_end_emitted(self, devin_session_id: str) -> bool:
+        return self._state.get("synced_sessions", {}).get(devin_session_id, {}).get("session_end_emitted", False)
+
+    def set_session_end_emitted(self, devin_session_id: str) -> None:
+        if "synced_sessions" not in self._state:
+            self._state["synced_sessions"] = {}
+        if devin_session_id not in self._state["synced_sessions"]:
+            self._state["synced_sessions"][devin_session_id] = {}
+        self._state["synced_sessions"][devin_session_id]["session_end_emitted"] = True
 
     def get_last_updated(self, devin_session_id: str) -> int:
         return self._state.get("synced_sessions", {}).get(devin_session_id, {}).get("last_updated_epoch", 0)
@@ -523,16 +535,20 @@ def _iso_to_epoch_ms(iso_str: str) -> int:
         return 0
 
 
-def map_devin_to_hh_session(session: dict, project: str) -> dict:
+def map_devin_to_hh_session(session: dict, project: str = "") -> dict:
     hh_session_id = devin_session_id_to_uuid(session["devin_session_id"])
 
     pr_urls = [pr.get("pr_url", "") for pr in session.get("pull_requests", []) if pr.get("pr_url")]
 
-    return {
-        "project": project,
+    # Extract initial user query for session inputs
+    initial_query = session.get("initial_query", "")
+
+    payload = {
+        **({"project": project} if project else {}),
         "session_id": hh_session_id,
         "session_name": session.get("title") or f"Devin Session {session['devin_session_id'][:8]}",
         "source": "devin-export",
+        "inputs": {"query": initial_query} if initial_query else {},
         "user_properties": {
             "devin_user_id": session.get("user_id", ""),
             "devin_session_id": session["devin_session_id"],
@@ -552,6 +568,7 @@ def map_devin_to_hh_session(session: dict, project: str) -> dict:
         "start_time": session.get("created_at_ms", 0),
         "end_time": session.get("updated_at_ms", 0),
     }
+    return payload
 
 
 def build_chat_history(messages: list) -> list:
@@ -564,9 +581,9 @@ def build_chat_history(messages: list) -> list:
     for msg in messages:
         msg_type = msg.get("type", "unknown")
         content = msg.get("message", "")
-        if msg_type in ("user_message", "user"):
+        if msg_type in ("user_message", "user", "initial_user_message"):
             role = "user"
-        elif msg_type in ("agent_message", "devin"):
+        elif msg_type in ("agent_message", "devin", "devin_message"):
             role = "assistant"
         else:
             role = msg_type
@@ -579,7 +596,7 @@ def map_devin_messages_to_hh_events(
     devin_session_id: str,
     hh_session_id: str,
     hh_parent_event_id: str,
-    project: str,
+    project: str = "",
     skip_count: int = 0,
 ) -> list:
     """Map normalized Devin messages to HoneyHive child events.
@@ -601,17 +618,17 @@ def map_devin_messages_to_hh_events(
         msg_user_id = msg.get("user_id")
         msg_username = msg.get("username")
 
-        is_user_message = msg_type in ("user_message", "user")
-        is_agent_message = msg_type in ("agent_message", "devin")
+        is_user_message = msg_type in ("user_message", "user", "initial_user_message")
+        is_agent_message = msg_type in ("agent_message", "devin", "devin_message")
 
         if is_user_message:
-            event_type = "tool"
-            event_name = "user_message"
+            event_type = "chain"
+            event_name = msg_type
             inputs = {"message": msg_content}
             outputs = {}
         elif is_agent_message:
             event_type = "model"
-            event_name = "agent_message"
+            event_name = msg_type
             inputs = {}
             outputs = {"message": msg_content}
         else:
@@ -621,7 +638,7 @@ def map_devin_messages_to_hh_events(
             outputs = {"message": msg_content}
 
         event = {
-            "project": project,
+            **({"project": project} if project else {}),
             "event_id": hh_event_id,
             "session_id": hh_session_id,
             "parent_id": hh_parent_event_id,
@@ -677,7 +694,7 @@ def map_devin_internal_events_to_hh_events(
     devin_session_id: str,
     hh_session_id: str,
     hh_parent_event_id: str,
-    project: str,
+    project: str = "",
     skip_count: int = 0,
 ) -> list:
     """Map normalized Devin internal events to HoneyHive child events.
@@ -721,7 +738,7 @@ def map_devin_internal_events_to_hh_events(
             outputs = {"content": summary}
 
         event = {
-            "project": project,
+            **({"project": project} if project else {}),
             "event_id": hh_event_id,
             "session_id": hh_session_id,
             "parent_id": hh_parent_event_id,
@@ -751,14 +768,16 @@ def map_devin_session_end(
     session: dict,
     hh_session_id: str,
     hh_parent_event_id: str,
-    project: str,
-    messages: list,
+    project: str = "",
+    messages: list = None,
 ) -> dict:
     """Create a session.end chain event with an artifact containing the conversation.
 
     This allows server-side evaluators (which trigger on session.end with
     outputs.artifact) to work on Devin sessions too.
     """
+    if messages is None:
+        messages = []
     end_event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"devin-session-end:{session['devin_session_id']}"))
     end_time = session.get("updated_at_ms", 0)
 
@@ -766,7 +785,7 @@ def map_devin_session_end(
     artifact_content = []
     for msg in messages:
         msg_type = msg.get("type", "unknown")
-        is_user = msg_type in ("user_message", "user")
+        is_user = msg_type in ("user_message", "user", "initial_user_message")
         artifact_content.append({
             "type": "tool_use" if not is_user else "text",
             "tool_name": msg_type if not is_user else None,
@@ -774,9 +793,8 @@ def map_devin_session_end(
             "timestamp": msg.get("timestamp", ""),
             "origin": msg.get("origin"),
         })
-
     return {
-        "project": project,
+        **({"project": project} if project else {}),
         "event_id": end_event_id,
         "session_id": hh_session_id,
         "parent_id": hh_parent_event_id,
@@ -933,26 +951,35 @@ def _sync_session_messages(
     if not messages:
         return 0
 
-    # ── Update chat_history + structured_output on the parent session event ──
+    # ── Update chat_history + structured_output + inputs on the parent session ──
     chat_history = build_chat_history(messages)
     session_outputs: dict = {"chat_history": chat_history}
     structured_output = details.get("structured_output")
     if structured_output is not None:
         session_outputs["structured_output"] = structured_output
+
+    # Extract initial user query from the first user message and store
+    # in metadata (PUT /events does not support updating inputs).
+    update_payload: dict = {"outputs": session_outputs}
+    initial_msg = next(
+        (m for m in messages if m.get("type") in ("initial_user_message", "user_message", "user")),
+        None,
+    )
+    if initial_msg:
+        update_payload["metadata"] = {"initial_query": initial_msg.get("message", "")}
+
     try:
-        hh.update_event(hh_parent_event_id, {"outputs": session_outputs})
+        hh.update_event(hh_parent_event_id, update_payload)
     except requests.RequestException as e:
         log.warning(
             "Failed to update chat_history on session %s: %s",
             devin_sid[:12], e,
         )
 
-    # ── Emit session.end for completed sessions (before early return) ──
-    # This must run even when there are no new messages, so that sessions
-    # that transition to finished/stopped/failed get a session.end event
-    # for server-side evaluators. The event_id is deterministic (UUID5),
-    # so re-emitting on subsequent syncs is idempotent.
-    if session:
+    # ── Emit session.end for completed sessions (once only) ──
+    # Only emit session.end once per session to avoid duplicates, since
+    # HoneyHive's events/batch endpoint does not deduplicate by event_id.
+    if session and not state.is_session_end_emitted(devin_sid):
         status = session.get("status", "")
         if status in ("finished", "stopped", "failed"):
             try:
@@ -964,6 +991,7 @@ def _sync_session_messages(
                     messages=messages,
                 )
                 hh.create_event_batch([end_event])
+                state.set_session_end_emitted(devin_sid)
                 log.info("Created session.end event for session %s (status=%s)", devin_sid[:12], status)
             except requests.RequestException as e:
                 log.warning("Failed to create session.end for %s: %s", devin_sid[:12], e)
@@ -1146,16 +1174,15 @@ def main() -> None:
     if not hh_api_url:
         log.error("HH_API_URL is required")
         sys.exit(1)
-    if not hh_project:
-        log.error("HH_PROJECT is required")
-        sys.exit(1)
-
     devin = DevinClient(api_key=devin_api_key, org_id=devin_org_id or None)
     hh = HoneyHiveClient(api_key=hh_api_key, api_url=hh_api_url, project=hh_project)
     state = SyncState(args.state_file)
 
     log.info("Devin API: %s mode", "v3" if devin.is_v3 else "v1")
-    log.info("HoneyHive: %s → project '%s'", hh.api_url, hh.project)
+    if hh.project:
+        log.info("HoneyHive: %s → project '%s'", hh.api_url, hh.project)
+    else:
+        log.info("HoneyHive: %s (project resolved from API key)", hh.api_url)
 
     if args.daemon:
         run_daemon(devin, hh, state, args.interval)
