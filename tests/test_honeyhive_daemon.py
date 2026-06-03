@@ -1119,7 +1119,7 @@ def test_push_pending_session_artifacts_updates_root_event(
     assert metrics_update["metadata"] is None
 
 
-def test_push_pending_session_artifacts_skips_unended_sessions(
+def test_push_pending_session_artifacts_finalizes_idle_unended_sessions(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
@@ -1149,6 +1149,9 @@ def test_push_pending_session_artifacts_skips_unended_sessions(
         "honeyhive_daemon.exporter.update_event",
         lambda *a, **kw: updated_events.append(kw),
     )
+    from honeyhive_daemon.state import append_chat_history
+
+    append_chat_history("sess-orphan", "user", "hi")
     idle_ms = 24 * 60 * 60 * 1000
     monkeypatch.setattr(
         "honeyhive_daemon.main._now_ms",
@@ -1162,10 +1165,15 @@ def test_push_pending_session_artifacts_skips_unended_sessions(
     _push_pending_session_artifacts(config)
 
     assert exported_events == []
-    assert updated_events == []
+    assert updated_events
+    assert any(
+        update.get("event_id") == "sess-orphan" and update.get("metrics")
+        for update in updated_events
+    )
+    assert all(update.get("event_id") != "sess-end-orphan" for update in updated_events)
     index = load_session_index()
     assert index["sess-orphan"].get("ended") is not True
-    assert index["sess-orphan"].get("artifact_pushed") is not True
+    assert index["sess-orphan"].get("artifact_pushed") is True
 
 
 def test_push_pending_session_artifacts_stops_after_max_retries(

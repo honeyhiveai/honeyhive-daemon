@@ -815,14 +815,6 @@ def _push_pending_session_artifacts(
 
         session_config = _resolve_session_config(session, config)
 
-        if not session.get("ended"):
-            log_message(
-                "skipped session artifact update "
-                f"session_id={session['session_id']} "
-                "because session has not ended"
-            )
-            continue
-
         transcript_content = _read_transcript_jsonl(transcript_path)
         if transcript_content is None:
             log_message(
@@ -845,6 +837,7 @@ def _push_pending_session_artifacts(
                 f"before={original_count} after={len(transcript_content)}"
             )
 
+        reason = "session_end" if session.get("ended") else "idle_timeout"
         chat_history = get_chat_history(session["session_id"])
         artifact_outputs = {
             "artifact": {
@@ -852,7 +845,7 @@ def _push_pending_session_artifacts(
                 "format": "json",
                 "path": transcript_path,
                 "content": transcript_content,
-                "reason": "session_end",
+                "reason": reason,
             }
         }
         session_start_id = str(session["event_id"])
@@ -899,7 +892,7 @@ def _push_pending_session_artifacts(
             log_message(
                 "updated session artifact "
                 f"session_id={session['session_id']} "
-                "reason=session_end"
+                f"reason={reason}"
             )
         except Exception as exc:  # pragma: no cover
             retry_count = increment_session_artifact_retry(session["session_id"])
