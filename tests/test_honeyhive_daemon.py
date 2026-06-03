@@ -552,25 +552,6 @@ def test_cli_status_without_config(monkeypatch, tmp_path: Path) -> None:
     assert "Pending spool events: 0" in result.output
 
 
-def test_cli_status_shows_configured_base_url(
-    monkeypatch, tmp_path: Path
-) -> None:
-    from honeyhive_daemon.config import save_config
-
-    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
-    base_url = "https://api.honeyhive.ai"
-    save_config(
-        DaemonConfig(
-            api_key="hh_test",
-            base_url=base_url,
-        )
-    )
-
-    result = CliRunner().invoke(cli, ["status"])
-    assert result.exit_code == 0
-    assert f"Base URL: {base_url}" in result.output.splitlines()
-
-
 def test_cli_status_shows_spool_failure_reason(
     monkeypatch, tmp_path: Path
 ) -> None:

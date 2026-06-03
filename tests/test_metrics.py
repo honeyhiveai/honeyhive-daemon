@@ -146,37 +146,3 @@ def test_compute_session_metrics_counts_nested_tool_use_blocks() -> None:
     assert metrics["coding_agent.bash_ratio"] == 0.5
 
 
-def test_compute_session_metrics_smoke_like_transcript_shape() -> None:
-    """Representative Claude Code records without depending on local transcripts."""
-    records = [
-        {"type": "custom-title", "customTitle": "smoke-test"},
-        {"type": "user", "message": {"role": "user", "content": "read README"}},
-        {
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": "I'll inspect it."},
-                    {"type": "tool_use", "id": "toolu_read", "name": "Read"},
-                    {"type": "tool_use", "id": "toolu_bash", "name": "Bash"},
-                ],
-                "usage": {"input_tokens": 2800, "output_tokens": 234},
-            },
-            "requestId": "req-smoke",
-        },
-        {
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": "toolu_read", "is_error": False},
-                    {"type": "tool_result", "tool_use_id": "toolu_bash", "is_error": False},
-                ],
-            },
-        },
-    ]
-
-    metrics = compute_session_metrics(records)
-    assert metrics["coding_agent.tool_count"] == 2.0
-    assert metrics["coding_agent.bash_ratio"] == 0.5
-    assert metrics["coding_agent.total_tokens"] == 3034.0

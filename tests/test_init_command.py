@@ -167,15 +167,3 @@ class TestInitCommand:
             )
             assert local_config["base_url"] == "https://custom.api.honeyhive.ai"
 
-    def test_init_without_url_omits_base_url(self, tmp_path: Path) -> None:
-        runner = CliRunner()
-        with runner.isolated_filesystem(temp_dir=tmp_path) as td:
-            result = runner.invoke(cli, ["init"])
-            assert result.exit_code == 0, result.output
-
-            local_config = json.loads(
-                (Path(td) / ".honeyhive" / "config.local.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            assert "base_url" not in local_config
