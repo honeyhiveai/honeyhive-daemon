@@ -19,7 +19,7 @@ Environment variables:
     DEVIN_ORG_ID        Required for v3 (cog_*) keys (auto-discovered if admin)
     HH_API_KEY          HoneyHive API key
     HH_API_URL          HoneyHive data plane URL
-    HH_PROJECT          HoneyHive project name
+    HH_PROJECT          HoneyHive project name (optional; API key is project-scoped)
     STATE_FILE_PATH     Path to sync state file (default: ./sync_state.json)
 """
 
@@ -427,7 +427,7 @@ class DevinClient:
 
 
 class HoneyHiveClient:
-    def __init__(self, api_key: str, api_url: str, project: str):
+    def __init__(self, api_key: str, api_url: str, project: str = ""):
         self.api_key = api_key
         self.api_url = api_url.rstrip("/")
         self.project = project
@@ -535,7 +535,7 @@ def _iso_to_epoch_ms(iso_str: str) -> int:
         return 0
 
 
-def map_devin_to_hh_session(session: dict, project: str) -> dict:
+def map_devin_to_hh_session(session: dict, project: str = "") -> dict:
     hh_session_id = devin_session_id_to_uuid(session["devin_session_id"])
 
     pr_urls = [pr.get("pr_url", "") for pr in session.get("pull_requests", []) if pr.get("pr_url")]
@@ -543,8 +543,8 @@ def map_devin_to_hh_session(session: dict, project: str) -> dict:
     # Extract initial user query for session inputs
     initial_query = session.get("initial_query", "")
 
-    return {
-        "project": project,
+    payload = {
+        **({"project": project} if project else {}),
         "session_id": hh_session_id,
         "session_name": session.get("title") or f"Devin Session {session['devin_session_id'][:8]}",
         "source": "devin-export",
@@ -568,6 +568,7 @@ def map_devin_to_hh_session(session: dict, project: str) -> dict:
         "start_time": session.get("created_at_ms", 0),
         "end_time": session.get("updated_at_ms", 0),
     }
+    return payload
 
 
 def build_chat_history(messages: list) -> list:
@@ -595,7 +596,7 @@ def map_devin_messages_to_hh_events(
     devin_session_id: str,
     hh_session_id: str,
     hh_parent_event_id: str,
-    project: str,
+    project: str = "",
     skip_count: int = 0,
 ) -> list:
     """Map normalized Devin messages to HoneyHive child events.
@@ -637,7 +638,7 @@ def map_devin_messages_to_hh_events(
             outputs = {"message": msg_content}
 
         event = {
-            "project": project,
+            **({"project": project} if project else {}),
             "event_id": hh_event_id,
             "session_id": hh_session_id,
             "parent_id": hh_parent_event_id,
@@ -693,7 +694,7 @@ def map_devin_internal_events_to_hh_events(
     devin_session_id: str,
     hh_session_id: str,
     hh_parent_event_id: str,
-    project: str,
+    project: str = "",
     skip_count: int = 0,
 ) -> list:
     """Map normalized Devin internal events to HoneyHive child events.
@@ -737,7 +738,7 @@ def map_devin_internal_events_to_hh_events(
             outputs = {"content": summary}
 
         event = {
-            "project": project,
+            **({"project": project} if project else {}),
             "event_id": hh_event_id,
             "session_id": hh_session_id,
             "parent_id": hh_parent_event_id,
@@ -767,14 +768,16 @@ def map_devin_session_end(
     session: dict,
     hh_session_id: str,
     hh_parent_event_id: str,
-    project: str,
-    messages: list,
+    project: str = "",
+    messages: list = None,
 ) -> dict:
     """Create a session.end chain event with an artifact containing the conversation.
 
     This allows server-side evaluators (which trigger on session.end with
     outputs.artifact) to work on Devin sessions too.
     """
+    if messages is None:
+        messages = []
     end_event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"devin-session-end:{session['devin_session_id']}"))
     end_time = session.get("updated_at_ms", 0)
 
@@ -790,9 +793,8 @@ def map_devin_session_end(
             "timestamp": msg.get("timestamp", ""),
             "origin": msg.get("origin"),
         })
-
     return {
-        "project": project,
+        **({"project": project} if project else {}),
         "event_id": end_event_id,
         "session_id": hh_session_id,
         "parent_id": hh_parent_event_id,
@@ -1172,16 +1174,15 @@ def main() -> None:
     if not hh_api_url:
         log.error("HH_API_URL is required")
         sys.exit(1)
-    if not hh_project:
-        log.error("HH_PROJECT is required")
-        sys.exit(1)
-
     devin = DevinClient(api_key=devin_api_key, org_id=devin_org_id or None)
     hh = HoneyHiveClient(api_key=hh_api_key, api_url=hh_api_url, project=hh_project)
     state = SyncState(args.state_file)
 
     log.info("Devin API: %s mode", "v3" if devin.is_v3 else "v1")
-    log.info("HoneyHive: %s → project '%s'", hh.api_url, hh.project)
+    if hh.project:
+        log.info("HoneyHive: %s → project '%s'", hh.api_url, hh.project)
+    else:
+        log.info("HoneyHive: %s (project resolved from API key)", hh.api_url)
 
     if args.daemon:
         run_daemon(devin, hh, state, args.interval)
