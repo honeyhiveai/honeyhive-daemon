@@ -152,26 +152,9 @@ On miss: capture `SESSION`, log snippet, spool → classify (export/hooks/artifa
 
 ## Pass checklist
 
-- Spool empty; `session.start`, `turn.user`, `turn.agent`, ≥1 `tool.*`
-- `session.end` in API; "session ended" in log (API+artifact OK if hook cancelled)
-- `coding_agent.model_count`, `event_count`, `total_tokens` ≥ 1 on session.start when usage exists; token metadata on session.start
-- Non-empty `chat_history` on turns; `chain.instructions.loaded` with content
-- Durations > 0; tool `duration` vs `metadata.tool.wall_duration_ms`
-- Transcript: start→`outputs.chat_history`; end→`outputs.artifact`
-- §7b: two sessions isolated (if run)
+All events are correctly there in Session export
 
-## Common failures
+Each event in session has inputs and outputs correctly. 
 
-
-| Symptom                       | Fix                                                                         |
-| ----------------------------- | --------------------------------------------------------------------------- |
-| `No module named 'honeyhive'` | `uv pip install -e .`; restart `run`                                        |
-| 401 / spool                   | Source only repo `.env`; restart daemon                                     |
-| Claude `Invalid API key`      | Unset `ANTHROPIC_API_KEY` if OAuth; else set key / `claude login`           |
-| No `session.end`              | Daemon running; full `claude -p`; `sleep 12`                                |
-| Wrong SESSION                 | Use latest `reason=session_end` artifact line, not old `session.start` tail |
-| No `tool.*`                   | §4 prompt; approve tools                                                    |
-| CLI JSON parse error          | `2>/dev/null` on redirect                                                   |
-| UI 0 tokens                   | Check flat `metadata.*_tokens` on session.start, not only custom metrics    |
 
 

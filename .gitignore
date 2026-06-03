@@ -20,5 +20,4 @@ update_event_api.txt
 
 .claude/settings.local.json
 .playwright-mcp/
-.cursor/
 .honeyhive/config.local.json
