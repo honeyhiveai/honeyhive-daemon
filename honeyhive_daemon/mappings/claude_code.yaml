@@ -413,7 +413,7 @@ event_mappings:
     inputs: {}
 
   UserPromptSubmit:
-    event_type: model
+    event_type: chain
     event_name: turn.user
     event_id_strategy: uuid4
     parent_id_strategy: session_root

@@ -354,7 +354,7 @@ def test_normalize_claude_user_prompt_event() -> None:
 
     assert event is not None
     assert event["event_name"] == "turn.user"
-    assert event["event_type"] == "model"
+    assert event["event_type"] == "chain"
     assert event["parent_id"] == "sess-prompt-1"
     # chat_history is injected at ingest time from session state, not at normalize time
     assert "chat_history" not in event.get("inputs", {})

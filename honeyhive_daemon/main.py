@@ -587,7 +587,7 @@ def ingest_claude_hook() -> None:
     # inputs.chat_history includes the current turn so every turn is inspectable
     # without reconstructing its own outputs client-side.
     turn_role = event.get("metadata", {}).get("turn.role")
-    if turn_role and event.get("event_type") == "model":
+    if turn_role:
         content = event.get("outputs", {}).get("content")
         if content is not None:
             session_id = str(event["session_id"])
