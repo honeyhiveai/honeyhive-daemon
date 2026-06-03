@@ -557,16 +557,17 @@ def test_cli_status_shows_configured_base_url(
     from honeyhive_daemon.config import save_config
 
     monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    base_url = "https://api.honeyhive.ai"
     save_config(
         DaemonConfig(
             api_key="hh_test",
-            base_url="https://api.honeyhive.ai",
+            base_url=base_url,
         )
     )
 
     result = CliRunner().invoke(cli, ["status"])
     assert result.exit_code == 0
-    assert "https://api.honeyhive.ai" in result.output
+    assert f"Base URL: {base_url}" in result.output.splitlines()
 
 
 def test_cli_status_shows_spool_failure_reason(
@@ -576,7 +577,7 @@ def test_cli_status_shows_spool_failure_reason(
     append_spool_event(
         {
             "event_name": "session.start",
-            "spool_reason": "Connection refused: https://api.honeyhive.ai/events",
+            "spool_reason": "Connection refused: honeyhive events endpoint",
         }
     )
 
