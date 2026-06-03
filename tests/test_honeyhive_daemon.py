@@ -417,7 +417,7 @@ def test_ingest_instructions_loaded_does_not_synthesize_session_start(
 
     class FakeEventsAPI:
         def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
-            captured.append(request.model_dump(exclude_none=True))
+            captured.append(_nested_event_dict(request))
 
     class FakeHoneyHive:
         def __init__(self, api_key: str, base_url: str) -> None:
@@ -636,7 +636,7 @@ def test_ingest_turn_chat_history_excludes_current_message(
 
     class FakeEventsAPI:
         def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
-            captured.append(request.model_dump(exclude_none=True))
+            captured.append(_nested_event_dict(request))
 
     class FakeHoneyHive:
         def __init__(self, api_key: str, base_url: str) -> None:
@@ -698,7 +698,7 @@ def test_ingest_tool_usage_attached_once_per_api_request(
 
     class FakeEventsAPI:
         def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
-            captured.append(request.model_dump(exclude_none=True))
+            captured.append(_nested_event_dict(request))
 
     class FakeHoneyHive:
         def __init__(self, api_key: str, base_url: str) -> None:
@@ -859,6 +859,10 @@ def test_ingest_session_end_logs_session_id(
     )
 
 
+def _nested_event_dict(request) -> dict:  # type: ignore[no-untyped-def]
+    event = request.event
+    return event.model_dump() if hasattr(event, "model_dump") else event
+
 
 def test_export_session_event_includes_session_name(monkeypatch, tmp_path: Path) -> None:
     """session_name is promoted to a top-level field on session events."""
@@ -867,7 +871,7 @@ def test_export_session_event_includes_session_name(monkeypatch, tmp_path: Path)
 
     class FakeEventsAPI:
         def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
-            captured["event"] = request.model_dump(exclude_none=True)
+            captured["event"] = _nested_event_dict(request)
 
     class FakeHoneyHive:
         def __init__(self, api_key: str, base_url: str) -> None:
@@ -906,7 +910,7 @@ def test_export_tool_event_no_session_name_field(monkeypatch, tmp_path: Path) ->
 
     class FakeEventsAPI:
         def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
-            captured["event"] = request.model_dump(exclude_none=True)
+            captured["event"] = _nested_event_dict(request)
 
     class FakeHoneyHive:
         def __init__(self, api_key: str, base_url: str) -> None:
@@ -945,7 +949,7 @@ def test_export_event_posts_honeyhive_event(monkeypatch, tmp_path: Path) -> None
 
     class FakeEventsAPI:
         def create_event(self, request) -> None:  # type: ignore[no-untyped-def]
-            captured["event"] = request.model_dump(exclude_none=True)
+            captured["event"] = _nested_event_dict(request)
 
     class FakeHoneyHive:
         def __init__(self, api_key: str, base_url: str) -> None:
@@ -979,7 +983,7 @@ def test_export_event_posts_honeyhive_event(monkeypatch, tmp_path: Path) -> None
     assert captured["api_key"] == "hh_test"
     assert captured["base_url"] == "https://api.honeyhive.ai"
     assert captured["event"]["event_id"] == "evt-1"
-    assert not captured["event"].get("project")
+    assert not captured["event"].get("project")  # project no longer in payload
     assert captured["event"]["event_type"] == "tool"
     assert captured["event"]["event_name"] == "tool.bash"
     assert captured["event"]["parent_id"] == "sess-1"
