@@ -229,24 +229,6 @@ def get_chat_history(session_id: str) -> List[Dict[str, str]]:
     return list(_load_chat_histories().get(session_id, []))
 
 
-def claim_skills_listed_export(session_id: str) -> bool:
-    """Atomically claim the one chain.skills.listed export slot for a session."""
-    with _locked_session_index() as index:
-        session = index.setdefault(
-            session_id,
-            {
-                "session_id": session_id,
-                "event_id": session_id,
-                "session_start_exported": False,
-                "artifact_pushed": False,
-            },
-        )
-        if session.get("skills_listed_exported"):
-            return False
-        session["skills_listed_exported"] = True
-        return True
-
-
 def claim_tool_usage_request_id(session_id: str, request_id: str) -> bool:
     """Return True if usage for this API request may be attached to a tool event.
 

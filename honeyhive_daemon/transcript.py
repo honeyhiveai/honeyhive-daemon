@@ -153,30 +153,6 @@ def get_context_for_latest_turn(transcript_path: str) -> TranscriptContext:
     return ctx
 
 
-def get_skills_listing(transcript_path: str) -> Optional[Dict[str, Any]]:
-    """Return skill names from the session's skill_listing transcript attachment.
-
-    Claude Code writes a one-time attachment listing discovered skills. This is
-    separate from InstructionsLoaded.
-    """
-    records = _load_transcript(transcript_path)
-    for record in records:
-        if record.get("type") != "attachment":
-            continue
-        attachment = record.get("attachment")
-        if not isinstance(attachment, dict):
-            continue
-        if attachment.get("type") != "skill_listing":
-            continue
-        names = attachment.get("names") or []
-        name_list = [str(name) for name in names]
-        return {
-            "names": name_list,
-            "count": int(attachment.get("skillCount") or len(name_list)),
-        }
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Legacy wrapper (kept for compatibility)
 # ---------------------------------------------------------------------------

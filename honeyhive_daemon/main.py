@@ -24,7 +24,6 @@ from .transcript import (
     TranscriptContext,
     get_context_for_latest_turn,
     get_context_for_tool_use,
-    get_skills_listing,
 )
 from .config import (
     DEFAULT_BASE_URL,
@@ -70,10 +69,8 @@ from .state import (
     get_expired_tool_events,
     get_sessions_needing_artifact,
     increment_session_artifact_retry,
-    load_session_index,
     log_message,
     mark_session_artifact_pushed,
-    claim_skills_listed_export,
     pop_pending_tool_event,
     read_spool_events,
     record_session_activity,
@@ -532,14 +529,6 @@ def ingest_claude_hook() -> None:
                 f"session_id={event['session_id']}: {exc}"
             )
 
-    _maybe_export_skills_listed(
-        config,
-        session_id=str(event["session_id"]),
-        transcript_path=str(transcript_path) if transcript_path else None,
-        metadata_base=event.get("metadata", {}),
-        timestamp_ms=int(event["start_time"]),
-    )
-
     # Pre+post tool event linking
     hook_phase = event.pop("_hook_phase", None)
     hook_failure = event.pop("_hook_failure", False)
@@ -751,77 +740,6 @@ def _flush_expired_tool_events(config: DaemonConfig) -> None:
             log_message(f"spooled orphaned tool event: {exc}")
 
 
-def _maybe_export_skills_listed(
-    config: DaemonConfig,
-    *,
-    session_id: str,
-    transcript_path: Optional[str],
-    metadata_base: dict,
-    timestamp_ms: int,
-) -> None:
-    """Export chain.skills.listed once when the transcript skill_listing appears."""
-    if not transcript_path:
-        return
-
-    listing = get_skills_listing(transcript_path)
-    if listing is None:
-        return
-
-    if not claim_skills_listed_export(session_id):
-        return
-
-    names = listing["names"]
-    metadata = {
-        k: v
-        for k, v in metadata_base.items()
-        if k
-        in (
-            "agent.provider",
-            "agent.product",
-            "capture.source",
-            "raw.format",
-            "agent.session_id",
-            "cwd",
-            "repo.path",
-            "git.revision",
-            "transcript.path",
-        )
-    }
-    metadata["skills.count"] = listing["count"]
-
-    skills_event = {
-        "event_id": str(uuid.uuid4()),
-        "session_id": session_id,
-        "parent_id": session_id,
-        "event_type": "chain",
-        "event_name": "chain.skills.listed",
-        "start_time": timestamp_ms,
-        "end_time": timestamp_ms,
-        "duration": 1,
-        "inputs": {},
-        "outputs": {
-            "names": names,
-            "count": listing["count"],
-        },
-        "metadata": metadata,
-    }
-
-    try:
-        export_event(config, skills_event)
-        log_message(
-            "exported skills listing "
-            f"session_id={session_id} "
-            f"count={listing['count']}"
-        )
-    except Exception as exc:
-        log_message(
-            f"spooled skills listing session_id={session_id}: {exc}"
-        )
-        skills_event["spool_reason"] = str(exc)
-        skills_event["_resolved_config"] = config.to_dict()
-        append_spool_event(skills_event)
-
-
 def _apply_transcript_context(
     event: dict, ctx: TranscriptContext, *, include_usage: bool = True
 ) -> None:
@@ -878,66 +796,6 @@ def _resolve_session_config(
     return cli_defaults
 
 
-def _synthesize_session_end(
-    session: dict,
-    config: DaemonConfig,
-    transcript_path: str,
-) -> dict:
-    """Create and export a synthetic session.end for an orphaned session.
-
-    Returns the (possibly refreshed) session dict.
-    """
-    session_id = str(session["session_id"])
-    session_name = session.get("session_name")
-    cwd = session.get("cwd")
-
-    synthetic_end: dict = {
-        "event_id": str(uuid.uuid4()),
-        "session_id": session_id,
-        "event_type": "chain",
-        "event_name": "session.end",
-        "start_time": int(session.get("last_activity_ms", _now_ms())),
-        "end_time": _now_ms(),
-        "duration": 0,
-        "inputs": {},
-        "outputs": {},
-        "parent_id": session_id,
-        "metadata": {
-            "agent.provider": "anthropic",
-            "agent.product": "claude-code",
-            "capture.source": "claude_hook",
-            "synthetic": True,
-            "synthetic.reason": "idle_timeout",
-        },
-    }
-    if session_name:
-        synthetic_end["metadata"]["session_name"] = session_name
-    if cwd:
-        synthetic_end["metadata"]["cwd"] = cwd
-
-    try:
-        export_event(config, synthetic_end)
-        record_session_activity(
-            session_id,
-            transcript_path=transcript_path,
-            last_activity_ms=_now_ms(),
-            ended=True,
-            session_end_event_id=synthetic_end["event_id"],
-        )
-        log_message(
-            "synthesized session.end for idle session "
-            f"session_id={session_id} "
-            f"session_name={session_name or '(unknown)'}"
-        )
-        return load_session_index().get(session_id, session)
-    except Exception as exc:
-        log_message(
-            f"failed to synthesize session.end "
-            f"session_id={session_id}: {exc}"
-        )
-        return session
-
-
 def _push_pending_session_artifacts(
     config: DaemonConfig, session_ids: Optional[list[str]] = None
 ) -> None:
@@ -957,22 +815,12 @@ def _push_pending_session_artifacts(
 
         session_config = _resolve_session_config(session, config)
 
-        needed_synthetic_end = not session.get("ended")
-        if needed_synthetic_end:
-            session = _synthesize_session_end(session, session_config, transcript_path)
-        if needed_synthetic_end and not session.get("ended"):
-            retry_count = increment_session_artifact_retry(session["session_id"])
+        if not session.get("ended"):
             log_message(
-                "failed to close idle session before artifact push "
+                "skipped session artifact update "
                 f"session_id={session['session_id']} "
-                f"retry={retry_count}/{ARTIFACT_MAX_RETRIES}"
+                "because session has not ended"
             )
-            if retry_count >= ARTIFACT_MAX_RETRIES:
-                mark_session_artifact_pushed(session["session_id"], _now_ms())
-                log_message(
-                    "giving up on session artifact after max retries "
-                    f"session_id={session['session_id']}"
-                )
             continue
 
         transcript_content = _read_transcript_jsonl(transcript_path)
@@ -997,7 +845,6 @@ def _push_pending_session_artifacts(
                 f"before={original_count} after={len(transcript_content)}"
             )
 
-        reason = "session_end" if session.get("ended") else "idle_timeout"
         chat_history = get_chat_history(session["session_id"])
         artifact_outputs = {
             "artifact": {
@@ -1005,11 +852,9 @@ def _push_pending_session_artifacts(
                 "format": "json",
                 "path": transcript_path,
                 "content": transcript_content,
-                "reason": reason,
+                "reason": "session_end",
             }
         }
-        if chat_history:
-            artifact_outputs["chat_history"] = chat_history
         session_start_id = str(session["event_id"])
         session_end_id = session.get("session_end_event_id")
         try:
@@ -1050,7 +895,7 @@ def _push_pending_session_artifacts(
             log_message(
                 "updated session artifact "
                 f"session_id={session['session_id']} "
-                f"reason={reason}"
+                "reason=session_end"
             )
         except Exception as exc:  # pragma: no cover
             retry_count = increment_session_artifact_retry(session["session_id"])
