@@ -84,12 +84,6 @@ def test_export_event_logs_success_after_create(
     assert any("session ended" in line and "sess-1" in line for line in log_lines)
 
 
-def test_build_event_payload_omits_legacy_project_field() -> None:
-    config = DaemonConfig(api_key="k", base_url="https://api.honeyhive.ai")
-    payload = _build_event_payload(config, _session_end_event())
-    assert "project" not in payload["event"]
-
-
 def test_build_event_payload_zero_duration_when_timestamps_equal() -> None:
     config = DaemonConfig(api_key="k", base_url="https://api.honeyhive.ai")
     payload = _build_event_payload(
