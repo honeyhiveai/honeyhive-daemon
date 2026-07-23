@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from honeyhive_daemon.config import DaemonConfig
-from honeyhive_daemon.exporter import _build_event_payload, export_event, update_event
+from honeyhive_daemon.exporter import (
+    _build_event_payload,
+    _build_post_event_request,
+    export_event,
+    update_event,
+)
 
 
 def _session_end_event(**overrides: object) -> dict:
@@ -82,6 +87,25 @@ def test_export_event_logs_success_after_create(
     )
     assert any("exported claude event" in line and "session.end" in line for line in log_lines)
     assert any("session ended" in line and "sess-1" in line for line in log_lines)
+
+
+def test_build_post_event_request_validates_against_installed_sdk() -> None:
+    """The exporter must construct a valid PostEventRequest for the installed SDK.
+
+    This exercises the real ``PostEventRequest`` model (not a mock) so a schema
+    shape change in the SDK — wrapped ``event=`` vs bare ``event_type``/``inputs``
+    — is caught here instead of silently dropping every event at runtime.
+    """
+    config = DaemonConfig(api_key="k", base_url="https://api.honeyhive.ai")
+    payload = _build_event_payload(config, _session_end_event(event_type="chain"))
+
+    request = _build_post_event_request(payload["event"])
+    dumped = request.model_dump()
+
+    if "event" in type(request).model_fields:
+        assert dumped["event"]["event_type"] == "chain"
+    else:
+        assert dumped["event_type"] == "chain"
 
 
 def test_build_event_payload_zero_duration_when_timestamps_equal() -> None:
