@@ -1,6 +1,6 @@
 [project]
 name = "honeyhive-daemon"
-version = "0.7.4"
+version = "0.7.5"
 description = "Minimal Claude Code telemetry daemon for HoneyHive"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,10 @@ dependencies = [
     "click>=8.1.0",
     "httpx>=0.27.0,<1.0",
     "pyyaml>=6.0",
-    "honeyhive>=1.1.0",
+    # Pinned: the public PostEventRequest schema shape has changed between SDK
+    # releases, so pin to the exact version the exporter is built against
+    # rather than auto-adopting an unvetted release that could flip the schema.
+    "honeyhive==1.4.0",
 ]
 
 [project.urls]
