@@ -20,22 +20,6 @@ except ImportError:  # pragma: no cover - exercised in local repo usage
     from honeyhive.models.models import PostEventRequest, UpdateEventRequest
 
 
-def _build_post_event_request(event_payload: Dict[str, Any]) -> "PostEventRequest":
-    """Construct a ``PostEventRequest`` for whichever schema the installed SDK exposes.
-
-    The public ``PostEventRequest`` alias has shipped in two mutually exclusive
-    shapes across SDK releases: a *wrapped* body (single required ``event``
-    field, i.e. ``PostEventRequest(event={...})``) and a *bare* event object
-    (required top-level ``event_type`` / ``inputs``, i.e.
-    ``PostEventRequest(**{...})``). Constructing for the wrong shape raises a
-    pydantic ``ValidationError`` and silently drops every event, so pick the
-    shape from the model's declared fields instead of assuming one.
-    """
-    if "event" in PostEventRequest.model_fields:
-        return PostEventRequest(event=event_payload)
-    return PostEventRequest(**event_payload)
-
-
 def export_event(config: DaemonConfig, event: Dict[str, Any]) -> None:
     """Export a normalized event through the HoneyHive Python SDK."""
     payload = _build_event_payload(config, event)
@@ -48,7 +32,7 @@ def export_event(config: DaemonConfig, event: Dict[str, Any]) -> None:
         f"api_key_fingerprint={_key_fingerprint(config.api_key)}"
     )
     client = HoneyHive(api_key=config.api_key, base_url=config.base_url)
-    client.events.create_event(_build_post_event_request(payload["event"]))
+    client.events.create_event(PostEventRequest(event=payload["event"]))
     log_message(
         "exported claude event "
         f"event_name={event['event_name']} "

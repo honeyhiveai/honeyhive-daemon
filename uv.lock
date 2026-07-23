@@ -201,7 +201,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.1.0" },
-    { name = "honeyhive", specifier = ">=1.1.0,<1.5.0" },
+    { name = "honeyhive", specifier = "==1.4.0" },
     { name = "httpx", specifier = ">=0.27.0,<1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
