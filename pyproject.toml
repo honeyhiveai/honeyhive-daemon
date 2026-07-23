@@ -1,6 +1,6 @@
 [project]
 name = "honeyhive-daemon"
-version = "0.7.4"
+version = "0.7.5"
 description = "Minimal Claude Code telemetry daemon for HoneyHive"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,9 @@ dependencies = [
     "click>=8.1.0",
     "httpx>=0.27.0,<1.0",
     "pyyaml>=6.0",
-    "honeyhive>=1.1.0",
+    # Upper-bounded: the public PostEventRequest schema shape has changed
+    # between SDK minors, so don't auto-adopt an unvetted new minor.
+    "honeyhive>=1.1.0,<1.5.0",
 ]
 
 [project.urls]

@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.11"
 
 [[package]]
@@ -166,7 +166,7 @@ wheels = [
 
 [[package]]
 name = "honeyhive"
-version = "1.1.0"
+version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -182,14 +182,14 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "wrapt" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/17/48/6c62193c9afd61692006586c6884a0ac28ac9334914309f35037914a43d0/honeyhive-1.1.0.tar.gz", hash = "sha256:9e5b58076370fd2e5437cff17c95a24c1fa8737d7a168a4c121a81afe6657a9c", size = 1115796, upload-time = "2026-05-19T23:18:41.449Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e5/16/d68cb9164815d634e58b8425751a3ab3c445ad0b6e54df6198214a917b51/honeyhive-1.4.0.tar.gz", hash = "sha256:abdcd48cdb23fecc5d3d79856079607f7a1c8f91f736dc4962b3297f495cd354", size = 1126220, upload-time = "2026-06-24T22:46:08.793Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e0/09/0905a03465970694ea09aaed389a5e1dc678ba524428bca24929b2519bd5/honeyhive-1.1.0-py3-none-any.whl", hash = "sha256:60c395fd679a5cc065dddd259b10125694287d58959dd51a558271da2dce31d7", size = 428269, upload-time = "2026-05-19T23:18:39.557Z" },
+    { url = "https://files.pythonhosted.org/packages/73/25/18aad23743024c3b0f96a941a9b97b6fb377fda811289fcff1e18bce0e92/honeyhive-1.4.0-py3-none-any.whl", hash = "sha256:b59a813e4a83b3231f4d252101020c1c0dde20bb71037bad4f1b654385d07e2c", size = 436807, upload-time = "2026-06-24T22:46:06.932Z" },
 ]
 
 [[package]]
 name = "honeyhive-daemon"
-version = "0.7.4"
+version = "0.7.5"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
@@ -201,7 +201,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.1.0" },
-    { name = "honeyhive", specifier = ">=1.1.0" },
+    { name = "honeyhive", specifier = ">=1.1.0,<1.5.0" },
     { name = "httpx", specifier = ">=0.27.0,<1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
