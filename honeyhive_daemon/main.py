@@ -105,6 +105,15 @@ def cli() -> None:
     help="HoneyHive base URL or OTLP traces endpoint.",
 )
 @click.option(
+    "--project",
+    envvar="HH_PROJECT",
+    default=None,
+    help=(
+        "Deprecated no-op, accepted for backward compatibility. "
+        "The project is resolved from the API key."
+    ),
+)
+@click.option(
     "--repo",
     type=click.Path(file_okay=False, path_type=Path),
     help="Repo to attach git commit events to.",
@@ -115,6 +124,7 @@ def run(
     ctx: click.Context,
     api_key: Optional[str],
     base_url: str,
+    project: Optional[str],
     repo: Optional[Path],
     ci: bool,
 ) -> None:
@@ -133,6 +143,14 @@ def run(
         click.echo(
             "Warning: --key is deprecated. "
             "Use 'honeyhive-daemon init' to set up per-project config."
+        )
+    # --project is accepted for backward compatibility but ignored: the
+    # project is resolved from the API key. Older callers (e.g. CI workflows)
+    # still pass it, so rejecting it would stop the daemon from starting.
+    if ctx.get_parameter_source("project") == click.core.ParameterSource.COMMANDLINE:
+        click.echo(
+            "Warning: --project is deprecated and ignored. "
+            "The project is resolved from the API key."
         )
     # --- Migrate CLI-provided key to user-level config --------------------
     if api_key and key_from_cli:

@@ -552,6 +552,32 @@ def test_cli_status_without_config(monkeypatch, tmp_path: Path) -> None:
     assert "Pending spool events: 0" in result.output
 
 
+def test_run_accepts_deprecated_project_flag(monkeypatch, tmp_path: Path) -> None:
+    """``run`` must accept (and ignore) the deprecated --project flag.
+
+    CI workflows still pass ``--project``; rejecting it makes the daemon exit
+    before starting, so every event is silently dropped. This guards against a
+    regression of the "No such option: --project" startup failure.
+    """
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "claude-settings.json"))
+
+    # ``run`` blocks in a `while True` poll loop; break out on the first tick.
+    def _stop(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("honeyhive_daemon.main.time.sleep", _stop)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--key", "test-key", "--project", "owner/repo", "--ci"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "No such option" not in result.output
+    assert "--project is deprecated and ignored" in result.output
+
+
 def test_cli_status_shows_spool_failure_reason(
     monkeypatch, tmp_path: Path
 ) -> None:
