@@ -1200,6 +1200,68 @@ def test_push_pending_session_artifacts_stops_after_max_retries(
     assert index["sess-retry-cap"].get("artifact_retry_count", 0) >= 3
 
 
+def test_push_pending_session_artifacts_retries_on_metrics_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A transient metrics-update failure must not permanently drop metrics.
+
+    Regression: the coding_agent.* metrics PUT used to sit in its own inner
+    try/except that swallowed the exception, after which the session was marked
+    artifact-pushed unconditionally — giving the metrics update zero retries
+    while the surrounding start/end updates got ARTIFACT_MAX_RETRIES. A single
+    transient failure therefore dropped the session's metrics forever. The
+    metrics update now shares the outer retry path, so a failure leaves the
+    session unmarked to be re-attempted on the next cycle.
+    """
+    monkeypatch.setenv("HH_DAEMON_HOME", str(tmp_path / "daemon-home"))
+    monkeypatch.setattr("honeyhive_daemon.main._now_ms", lambda: 2000)
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        '{"type":"user","message":{"role":"user","content":"hi"}}\n',
+        encoding="utf-8",
+    )
+    record_session_activity(
+        "sess-metrics-drop",
+        transcript_path=str(transcript_path),
+        last_activity_ms=1000,
+        ended=True,
+        session_end_event_id="sess-end-metrics",
+    )
+
+    metrics_attempts = []
+
+    def fake_update_event(  # type: ignore[no-untyped-def]
+        config, *, event_id, inputs=None, outputs=None, metadata=None, metrics=None
+    ):
+        # Only the metrics PUT carries `metrics`; simulate it failing transiently
+        # while the session.start inputs/outputs update succeeds.
+        if metrics is not None:
+            metrics_attempts.append(event_id)
+            raise RuntimeError("429 Too Many Requests")
+
+    monkeypatch.setattr(
+        "honeyhive_daemon.exporter.update_event",
+        fake_update_event,
+    )
+    monkeypatch.setattr(
+        "honeyhive_daemon.exporter.update_event_outputs",
+        lambda *a, **kw: None,
+    )
+
+    config = DaemonConfig(
+        api_key="hh_test",
+        base_url="https://api.honeyhive.ai",
+    )
+    _push_pending_session_artifacts(config)
+
+    assert metrics_attempts == ["sess-metrics-drop"]
+    index = load_session_index()
+    # Session must NOT be flagged done, so it is retried on the next cycle.
+    assert index["sess-metrics-drop"].get("artifact_pushed") is not True
+    assert index["sess-metrics-drop"].get("artifact_retry_count", 0) == 1
+
+
 # ---------------------------------------------------------------------------
 # _extract_error — WAG-310: guard against list values in ev["error"]
 # ---------------------------------------------------------------------------
