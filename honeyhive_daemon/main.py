@@ -66,6 +66,7 @@ from .state import (
     append_chat_history,
     append_spool_event,
     claim_tool_usage_request_id,
+    discard_acked_session_events,
     drain_spool_events,
     get_chat_history,
     split_session_start_chat_history,
@@ -911,6 +912,7 @@ def _push_pending_session_artifacts(
                     )
 
             mark_session_artifact_pushed(session["session_id"], _now_ms())
+            discard_acked_session_events(session["session_id"])
             log_message(
                 "updated session artifact "
                 f"session_id={session['session_id']} "

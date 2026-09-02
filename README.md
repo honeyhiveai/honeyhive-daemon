@@ -114,6 +114,8 @@ The daemon runs a housekeeping pass at startup and every 15 minutes, and `honeyh
 - `spool/events.jsonl` is trimmed to the newest N events, so an export failure that never resolves (revoked key, unreachable data plane) can't fill the disk.
 - Session index, chat history, and buffered tool-event entries are dropped for sessions whose artifact was pushed longer ago than the retention window. Sessions still awaiting finalization are always kept.
 
+Locally buffered events are also deleted as soon as HoneyHive acknowledges them, independent of the housekeeping pass: a spooled event is removed once its retry gets a success response (failures are re-spooled with their `spool_reason`), and a session's chat history and buffered tool events are dropped as soon as its session artifact update is acked. Only the small session index entry survives — it prevents a duplicate `session.start` export if the session resumes — and the retention window removes that later.
+
 | Env var | Default | Description |
 |---------|---------|-------------|
 | `HH_DAEMON_LOG_MAX_BYTES` | `5242880` (5 MiB) | Log size that triggers rotation; `0` disables rotation. |

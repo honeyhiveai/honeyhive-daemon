@@ -6,6 +6,8 @@ from honeyhive_daemon.config import get_log_path, get_sessions_path
 from honeyhive_daemon.housekeeping import run_housekeeping
 from honeyhive_daemon.state import (
     append_spool_event,
+    claim_tool_usage_request_id,
+    discard_acked_session_events,
     buffer_pending_tool_event,
     append_chat_history,
     get_chat_history,
@@ -112,6 +114,33 @@ def test_prune_finished_sessions_drops_stale_state(monkeypatch, tmp_path) -> Non
     from honeyhive_daemon.state import _load_pending_tools
 
     assert _load_pending_tools() == {}
+
+
+def test_discard_acked_session_events(monkeypatch, tmp_path) -> None:
+    _use_home(monkeypatch, tmp_path)
+    save_session_index(
+        {
+            "acked": {"session_id": "acked", "artifact_pushed": True},
+            "other": {"session_id": "other"},
+        }
+    )
+    append_chat_history("acked", "user", "hello")
+    append_chat_history("other", "user", "hi")
+    buffer_pending_tool_event("acked", "tool-1", {"event_id": "t1", "start_time": 0})
+    buffer_pending_tool_event("other", "tool-1", {"event_id": "t2", "start_time": 0})
+    claim_tool_usage_request_id("acked", "req-1")
+
+    discard_acked_session_events("acked")
+
+    assert get_chat_history("acked") == []
+    assert get_chat_history("other") == [{"role": "user", "content": "hi"}]
+    from honeyhive_daemon.state import _load_pending_tools
+
+    assert list(_load_pending_tools()) == ["other:tool-1"]
+    index = load_session_index()
+    # The index entry survives so a resumed session isn't re-exported.
+    assert index["acked"]["artifact_pushed"] is True
+    assert "tool_usage_request_ids" not in index["acked"]
 
 
 def test_prune_disabled_when_retention_zero(monkeypatch, tmp_path) -> None:

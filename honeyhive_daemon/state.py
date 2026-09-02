@@ -189,6 +189,33 @@ def trim_spool(max_events: int) -> int:
         return dropped
 
 
+def discard_acked_session_events(session_id: str) -> None:
+    """Drop locally buffered events for a session HoneyHive has acknowledged.
+
+    Called once the session artifact update is acked, so chat history, buffered
+    tool events, and per-request usage claims don't linger on disk.  The small
+    session index entry is kept (it guards against duplicate ``session.start``
+    exports on resume) and is removed later by :func:`prune_finished_sessions`.
+    """
+    with _locked_json_mapping(
+        get_chat_histories_path(), "skipped malformed chat histories index"
+    ) as histories:
+        histories.pop(session_id, None)
+
+    with _locked_json_mapping(
+        get_pending_tools_path(), "skipped malformed pending tools index"
+    ) as pending:
+        for key in list(pending):
+            if key.split(":", 1)[0] == session_id:
+                pending.pop(key, None)
+
+    with _locked_session_index() as index:
+        session = index.get(session_id)
+        if session is not None:
+            session.pop("tool_usage_request_ids", None)
+            index[session_id] = session
+
+
 def prune_finished_sessions(max_age_ms: int, *, now_ms: int) -> int:
     """Drop state for sessions finished longer ago than *max_age_ms*.
 
