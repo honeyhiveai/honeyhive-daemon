@@ -103,7 +103,23 @@ All daemon state lives under `~/.honeyhive/daemon/` (override with `HH_DAEMON_HO
 | `state/chat_histories.json` | Accumulated chat history per session for turn events |
 | `spool/events.jsonl` | Retry queue for failed exports |
 | `daemon.log` | Timestamped daemon log |
+| `daemon.log.1` … `daemon.log.N` | Rotated daemon logs (oldest is deleted) |
 | `daemon.pid` | Process ID file |
+
+#### Retention
+
+The daemon runs a housekeeping pass at startup and every 15 minutes, and `honeyhive-daemon housekeeping` runs one on demand:
+
+- `daemon.log` is rotated once it reaches its size limit (also checked on every log write, since hooks log from short-lived processes), keeping a fixed number of `daemon.log.N` backups.
+- `spool/events.jsonl` is trimmed to the newest N events, so an export failure that never resolves (revoked key, unreachable data plane) can't fill the disk.
+- Session index, chat history, and buffered tool-event entries are dropped for sessions whose artifact was pushed longer ago than the retention window. Sessions still awaiting finalization are always kept.
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `HH_DAEMON_LOG_MAX_BYTES` | `5242880` (5 MiB) | Log size that triggers rotation; `0` disables rotation. |
+| `HH_DAEMON_LOG_BACKUPS` | `3` | Rotated logs to keep; `0` truncates in place instead. |
+| `HH_DAEMON_SPOOL_MAX_EVENTS` | `10000` | Spool events to retain; `0` disables trimming. |
+| `HH_DAEMON_STATE_RETENTION_DAYS` | `7` | Age at which finished session state is pruned; `0` disables pruning. |
 
 ### CLI reference
 
@@ -112,7 +128,8 @@ All daemon state lives under `~/.honeyhive/daemon/` (override with `HH_DAEMON_HO
 | `honeyhive-daemon init` | Scaffold `.honeyhive/` in the current repo (API key env var reference). Set `HH_API_URL` in the environment for non-default endpoints; project comes from your API key. |
 | `honeyhive-daemon run` | Start the daemon, install hooks, and flush queued events. |
 | `honeyhive-daemon stop` | Stop the running daemon. |
-| `honeyhive-daemon status` | Show config, pending spool event count, and failure reasons for spooled events. |
+| `honeyhive-daemon status` | Show config, pending spool event count, failure reasons for spooled events, and daemon log size. |
+| `honeyhive-daemon housekeeping` | Run a retention pass now: rotate the log, trim the spool, prune finished session state. |
 | `honeyhive-daemon doctor` | Check that hooks and config are correctly installed. |
 | `honeyhive-daemon analyze` | Query HoneyHive traces for a time window and emit a JSON report of recurring error patterns. |
 | `honeyhive-daemon add-to-ci` | Generate a GitHub Actions workflow that runs `analyze` on a schedule and opens PRs for recurring patterns. |
@@ -169,8 +186,9 @@ If events aren't showing up in HoneyHive, work through these checks in order:
 2. **Check the log.** `tail -100 ~/.honeyhive/daemon/daemon.log` — look for `spooled` (export failures) or missing `received claude hook` entries.
 3. **Verify config.** `cat ~/.honeyhive/daemon/state/config.json` — confirm API key and base URL are correct.
 4. **Hooks installed?** Run `honeyhive-daemon doctor` or inspect `~/.claude/settings.json` for the hook command.
-5. **Spool buildup?** `wc -l ~/.honeyhive/daemon/spool/events.jsonl` — if events are piling up, check the `spool_reason` field for error details.
-6. **PATH issues.** Ensure `honeyhive-daemon` is on PATH in the shell context Claude Code uses (`which honeyhive-daemon`). Virtualenv installations may not be visible to hooks.
+5. **Spool buildup?** `wc -l ~/.honeyhive/daemon/spool/events.jsonl` — if events are piling up, check the `spool_reason` field for error details. The spool is capped, so a sustained failure drops the oldest events.
+6. **Disk usage?** `honeyhive-daemon status` reports the current log size; `honeyhive-daemon housekeeping` forces a rotation/prune pass. See [Retention](#retention) for the tunables.
+7. **PATH issues.** Ensure `honeyhive-daemon` is on PATH in the shell context Claude Code uses (`which honeyhive-daemon`). Virtualenv installations may not be visible to hooks.
 
 ### Evaluators
 

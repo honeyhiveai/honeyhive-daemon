@@ -31,6 +31,8 @@ from .config import (
     _get_user_config_path,
     get_claude_settings_path,
     get_daemon_home,
+    get_log_max_bytes,
+    get_log_path,
     get_pid_path,
     load_config,
     load_user_config,
@@ -55,6 +57,7 @@ from .git_hooks import (
     get_commit_link_payload,
     install_post_commit_hook,
 )
+from .housekeeping import HOUSEKEEPING_INTERVAL_SEC, run_housekeeping
 from .metrics import (
     compute_session_metrics as _compute_session_metrics,
     read_transcript_jsonl as _read_transcript_jsonl,
@@ -201,6 +204,7 @@ def run(
         f"ci={ci}"
     )
     _flush_spool(config)
+    run_housekeeping()
 
     click.echo(f"Daemon home: {get_daemon_home()}")
     click.echo(f"Filters: {filters_path}")
@@ -236,12 +240,16 @@ def run(
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
+    last_housekeeping = time.monotonic()
     try:
         while True:
             time.sleep(5)
             _flush_spool(config)
             _flush_expired_tool_events(config)
             _push_pending_session_artifacts(config)
+            if time.monotonic() - last_housekeeping >= HOUSEKEEPING_INTERVAL_SEC:
+                run_housekeeping()
+                last_housekeeping = time.monotonic()
     except KeyboardInterrupt:
         click.echo("\nStopping HoneyHive daemon.")
     finally:
@@ -314,9 +322,23 @@ def status() -> None:
             reasons[reason] = reasons.get(reason, 0) + 1
         for reason, count in reasons.items():
             click.echo(f"  Spool reason ({count}x): {reason}")
+    log_path = get_log_path()
+    log_size = log_path.stat().st_size if log_path.exists() else 0
+    max_bytes = get_log_max_bytes()
+    rotation = f"{max_bytes / 1024:.0f} KiB" if max_bytes else "disabled"
+    click.echo(f"Log size: {log_size / 1024:.1f} KiB (rotation: {rotation})")
     if config:
         click.echo(f"Base URL: {config.base_url}")
         click.echo(f"Repo: {config.repo_path or '-'}")
+
+
+@cli.command("housekeeping")
+def housekeeping_cmd() -> None:
+    """Rotate the daemon log, trim the spool, and prune finished session state."""
+    report = run_housekeeping()
+    click.echo(f"Log rotated: {'yes' if report.log_rotated else 'no'}")
+    click.echo(f"Spool events dropped: {report.spool_events_dropped}")
+    click.echo(f"Sessions pruned: {report.sessions_pruned}")
 
 
 @cli.command()
