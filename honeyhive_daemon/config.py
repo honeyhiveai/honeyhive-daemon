@@ -13,6 +13,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_BASE_URL = "https://api.dp1.us.prod.honeyhive.ai"
 
+DEFAULT_LOG_MAX_BYTES = 5 * 1024 * 1024
+DEFAULT_LOG_BACKUP_COUNT = 3
+DEFAULT_SPOOL_MAX_EVENTS = 10_000
+DEFAULT_STATE_RETENTION_DAYS = 7
+
 
 @dataclass
 class DaemonConfig:
@@ -74,6 +79,38 @@ def get_spool_path() -> Path:
 def get_sessions_path() -> Path:
     """Return the tracked session state path."""
     return get_state_dir() / "sessions.json"
+
+
+def _env_int(name: str, default: int) -> int:
+    """Return a non-negative int from the environment, falling back to *default*."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def get_log_max_bytes() -> int:
+    """Return the daemon log size that triggers rotation (0 disables rotation)."""
+    return _env_int("HH_DAEMON_LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES)
+
+
+def get_log_backup_count() -> int:
+    """Return how many rotated daemon logs to keep (0 truncates instead)."""
+    return _env_int("HH_DAEMON_LOG_BACKUPS", DEFAULT_LOG_BACKUP_COUNT)
+
+
+def get_spool_max_events() -> int:
+    """Return the maximum retained spool events (0 disables trimming)."""
+    return _env_int("HH_DAEMON_SPOOL_MAX_EVENTS", DEFAULT_SPOOL_MAX_EVENTS)
+
+
+def get_state_retention_days() -> int:
+    """Return how long finished session state is kept (0 disables pruning)."""
+    return _env_int("HH_DAEMON_STATE_RETENTION_DAYS", DEFAULT_STATE_RETENTION_DAYS)
 
 
 def get_pid_path() -> Path:
