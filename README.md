@@ -6,10 +6,10 @@ This repo contains two independent exporters:
 
 | Exporter | Install | Agents | How it works |
 |---|---|---|---|
-| **Claude Code Daemon** | `pip install honeyhive-daemon` | Claude Code | Local daemon process, captures via Claude Code hooks in real-time |
+| **Claude Code Daemon** | `claude plugin install honeyhive-observability@honeyhive` or `pip install honeyhive-daemon` | Claude Code, Cowork | Local daemon process, captures via Claude Code hooks in real-time |
 | **Devin Exporter** | `pip install -r devin/requirements.txt` | Devin | Standalone script, polls Devin's API and batch-syncs sessions |
 
-The daemon is published to PyPI as `honeyhive-daemon`. The Devin exporter is **not** included in the pip package — it lives in `devin/` and is run directly from this repo.
+The daemon is published to PyPI as `honeyhive-daemon` and as the Claude Code plugin `honeyhive-observability`. The Devin exporter is **not** included in the pip package — it lives in `devin/` and is run directly from this repo.
 
 ## Claude Code Daemon
 
@@ -26,6 +26,58 @@ A local daemon that captures Claude Code activity via hooks and exports structur
 
 ### Quickstart
 
+There are two ways to wire Claude Code up to the daemon. Both run the same
+exporter — they differ only in who registers the hooks.
+
+#### Option A — Claude Code plugin (recommended)
+
+This repo is also a Claude Code / Cowork plugin, `honeyhive-observability`. It
+ships the hook registrations, so you never hand-edit `~/.claude/settings.json`.
+
+```bash
+# Register the marketplace and install the plugin
+claude plugin marketplace add honeyhiveai/skills
+claude plugin install honeyhive-observability@honeyhive
+
+# The plugin wires the hooks; the daemon does the exporting
+pip install honeyhive-daemon
+export HH_API_KEY=your-key
+honeyhive-daemon run
+```
+
+Restart Claude Code after installing so the hook configuration loads.
+
+You can store the API key in the plugin instead of your shell — from inside a
+Claude Code session:
+
+```text
+/plugin configure honeyhive-observability
+```
+
+The plugin accepts:
+
+| Option | Description |
+|---|---|
+| `HH_API_KEY` | Your HoneyHive API key. Stored in your OS keychain. Leave empty to use an `HH_API_KEY` already exported in your shell. |
+| `HH_API_URL` | Base URL for the HoneyHive API. Only for self-hosted or non-default endpoints. |
+| `HONEYHIVE_DAEMON_BIN` | Absolute path to `honeyhive-daemon`. Only needed when it lives in a virtualenv that is not on the PATH Claude Code sees. |
+
+To check that events are actually landing in HoneyHive, run this in a session:
+
+```text
+/honeyhive-observability:status
+```
+
+The plugin only registers hooks — it does **not** bundle the Python daemon. If
+`honeyhive-daemon` is missing, never configured, or not running, the plugin says
+so once at session start with the command that fixes it, rather than letting the
+session look instrumented while dropping every event. Individual hook calls stay
+silent and non-blocking, so a broken export never interrupts your work.
+
+#### Option B — pip only
+
+The daemon registers its own hooks at the user level when you run it:
+
 ```bash
 pip install honeyhive-daemon
 
@@ -41,7 +93,30 @@ honeyhive-daemon run
 
 Project scope is resolved from your API key — no project name on `init` or `run`.
 
-The daemon stores local state in `~/.honeyhive/daemon/` and installs Claude hooks in `~/.claude/settings.json`.
+The daemon stores local state in `~/.honeyhive/daemon/`. With Option B it also
+installs Claude hooks in `~/.claude/settings.json`; with Option A the plugin
+provides them instead. Running both is harmless but duplicates every event, so
+pick one.
+
+#### Plugin layout
+
+| Path | Purpose |
+|---|---|
+| `.claude-plugin/plugin.json` | Plugin manifest — metadata and user-configurable options |
+| `hooks/hooks.json` | Hook registrations, generated from `honeyhive_daemon/mappings/claude_code.yaml` |
+| `hooks/honeyhive-ingest.sh` | Pipes each hook payload to `honeyhive-daemon ingest claude-hook` |
+| `hooks/honeyhive-preflight.sh` | Once-per-session check that the daemon is installed, configured and running |
+| `skills/status/SKILL.md` | `/honeyhive-observability:status` — diagnose the export pipeline |
+
+`hooks/hooks.json` is generated so the plugin and `honeyhive-daemon run` always
+register the same set of events. After editing `hook_registrations` in
+`honeyhive_daemon/mappings/claude_code.yaml`, regenerate it:
+
+```bash
+python scripts/generate_plugin_hooks.py
+```
+
+`tests/test_plugin_manifest.py` fails if the two drift apart.
 
 ### Running in the background
 
@@ -168,7 +243,7 @@ If events aren't showing up in HoneyHive, work through these checks in order:
 1. **Is the daemon running?** Check `~/.honeyhive/daemon/daemon.pid` and verify the process is alive with `ps`.
 2. **Check the log.** `tail -100 ~/.honeyhive/daemon/daemon.log` — look for `spooled` (export failures) or missing `received claude hook` entries.
 3. **Verify config.** `cat ~/.honeyhive/daemon/state/config.json` — confirm API key and base URL are correct.
-4. **Hooks installed?** Run `honeyhive-daemon doctor` or inspect `~/.claude/settings.json` for the hook command.
+4. **Hooks installed?** Run `honeyhive-daemon doctor`. With the pip install, inspect `~/.claude/settings.json` for the hook command; with the plugin, check `claude plugin list` shows `honeyhive-observability` enabled and run `/honeyhive-observability:status` in a session.
 5. **Spool buildup?** `wc -l ~/.honeyhive/daemon/spool/events.jsonl` — if events are piling up, check the `spool_reason` field for error details.
 6. **PATH issues.** Ensure `honeyhive-daemon` is on PATH in the shell context Claude Code uses (`which honeyhive-daemon`). Virtualenv installations may not be visible to hooks.
 
