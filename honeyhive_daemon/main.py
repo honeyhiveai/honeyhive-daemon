@@ -869,24 +869,24 @@ def _push_pending_session_artifacts(
                 )
             session_metrics = _compute_session_metrics(transcript_content)
             if session_metrics:
-                try:
-                    token_metadata = _session_token_metadata(session_metrics)
-                    update_event(
-                        session_config,
-                        event_id=session_start_id,
-                        metadata=token_metadata or None,
-                        metrics=session_metrics,
-                    )
-                    log_message(
-                        "attached session metrics "
-                        f"session_id={session['session_id']} "
-                        f"metrics_count={len(session_metrics)}"
-                    )
-                except Exception as metrics_exc:
-                    log_message(
-                        "failed to attach session metrics "
-                        f"session_id={session['session_id']}: {metrics_exc}"
-                    )
+                # The metrics update stays inside the outer try/except on
+                # purpose: a transient failure must fall through to the bounded
+                # artifact retry loop below instead of being swallowed while the
+                # session is still marked done. events.update is an idempotent
+                # PUT keyed by event_id, so re-sending the already-succeeded
+                # start/end updates on the next cycle is safe.
+                token_metadata = _session_token_metadata(session_metrics)
+                update_event(
+                    session_config,
+                    event_id=session_start_id,
+                    metadata=token_metadata or None,
+                    metrics=session_metrics,
+                )
+                log_message(
+                    "attached session metrics "
+                    f"session_id={session['session_id']} "
+                    f"metrics_count={len(session_metrics)}"
+                )
 
             mark_session_artifact_pushed(session["session_id"], _now_ms())
             log_message(
