@@ -754,11 +754,14 @@ def _apply_transcript_context(
     if include_usage and ctx.usage:
         for key, value in ctx.usage.items():
             metadata[f"usage.{key}"] = value
-        # Alias to HoneyHive standard field names
-        if "input_tokens" in ctx.usage:
-            metadata["prompt_tokens"] = ctx.usage["input_tokens"]
-        if "output_tokens" in ctx.usage:
-            metadata["completion_tokens"] = ctx.usage["output_tokens"]
+        metadata.update(
+            _token_metadata(
+                ctx.usage.get("input_tokens"),
+                ctx.usage.get("output_tokens"),
+                ctx.usage.get("cache_read_input_tokens"),
+                ctx.usage.get("cache_creation_input_tokens"),
+            )
+        )
 
 
 def _flush_spool(config: DaemonConfig) -> None:
@@ -909,20 +912,37 @@ def _push_pending_session_artifacts(
                 )
 
 
-def _session_token_metadata(metrics: dict) -> dict:
-    """Return standard token metadata aliases for session-level UI rollups."""
+def _token_metadata(
+    input_tokens: Optional[float],
+    output_tokens: Optional[float],
+    cache_read_tokens: Optional[float],
+    cache_write_tokens: Optional[float],
+) -> dict:
+    """Return HoneyHive token fields; Anthropic input_tokens excludes cache, so add it back."""
     metadata: dict = {}
-    input_tokens = metrics.get("coding_agent.total_input_tokens")
-    output_tokens = metrics.get("coding_agent.total_output_tokens")
-    total_tokens = metrics.get("coding_agent.total_tokens")
-
+    if cache_read_tokens is not None:
+        metadata["cache_read_input_tokens"] = cache_read_tokens
+    if cache_write_tokens is not None:
+        metadata["cache_write_input_tokens"] = cache_write_tokens
     if input_tokens is not None:
-        metadata["prompt_tokens"] = input_tokens
+        metadata["prompt_tokens"] = (
+            input_tokens + (cache_read_tokens or 0) + (cache_write_tokens or 0)
+        )
     if output_tokens is not None:
         metadata["completion_tokens"] = output_tokens
-    if total_tokens is not None:
-        metadata["total_tokens"] = total_tokens
+    if input_tokens is not None and output_tokens is not None:
+        metadata["total_tokens"] = metadata["prompt_tokens"] + output_tokens
     return metadata
+
+
+def _session_token_metadata(metrics: dict) -> dict:
+    """Return standard token metadata aliases for session-level UI rollups."""
+    return _token_metadata(
+        metrics.get("coding_agent.total_input_tokens"),
+        metrics.get("coding_agent.total_output_tokens"),
+        metrics.get("coding_agent.total_cache_read_tokens"),
+        metrics.get("coding_agent.total_cache_creation_tokens"),
+    )
 
 
 def _settings_have_command(settings_path: Path) -> bool:
