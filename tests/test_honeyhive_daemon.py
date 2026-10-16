@@ -22,6 +22,7 @@ from honeyhive_daemon.main import (
     _flush_spool,
     _merge_tool_events,
     _push_pending_session_artifacts,
+    _apply_transcript_context,
     _session_token_metadata,
     cli,
 )
@@ -782,10 +783,53 @@ def test_session_token_metadata_aliases_coding_agent_metrics() -> None:
     )
 
     assert metadata == {
+        "prompt_tokens": 1173.0,
+        "completion_tokens": 45.0,
+        "total_tokens": 1218.0,
+        "cache_read_input_tokens": 1000.0,
+        "cache_write_input_tokens": 50.0,
+    }
+
+
+def test_session_token_metadata_without_cache() -> None:
+    metadata = _session_token_metadata(
+        {
+            "coding_agent.total_input_tokens": 123.0,
+            "coding_agent.total_output_tokens": 45.0,
+            "coding_agent.total_tokens": 168.0,
+        }
+    )
+
+    assert metadata == {
         "prompt_tokens": 123.0,
         "completion_tokens": 45.0,
         "total_tokens": 168.0,
     }
+
+
+def test_apply_transcript_context_counts_cache_in_prompt_tokens() -> None:
+    from honeyhive_daemon.transcript import TranscriptContext
+
+    ctx = TranscriptContext()
+    ctx.usage = {
+        "input_tokens": 18,
+        "cache_read_input_tokens": 1000,
+        "cache_creation_input_tokens": 200,
+        "output_tokens": 6,
+    }
+    event: dict = {}
+
+    _apply_transcript_context(event, ctx)
+
+    metadata = event["metadata"]
+    assert metadata["usage.input_tokens"] == 18
+    assert metadata["usage.cache_read_input_tokens"] == 1000
+    assert metadata["usage.cache_creation_input_tokens"] == 200
+    assert metadata["prompt_tokens"] == 1218
+    assert metadata["completion_tokens"] == 6
+    assert metadata["total_tokens"] == 1224
+    assert metadata["cache_read_input_tokens"] == 1000
+    assert metadata["cache_write_input_tokens"] == 200
 
 
 def test_ingest_session_end_logs_session_id(
