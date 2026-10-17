@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from .config import (
     ensure_state_layout,
     get_chat_histories_path,
+    get_log_backup_count,
+    get_log_max_bytes,
     get_log_path,
     get_pending_tools_path,
     get_sessions_path,
@@ -19,11 +23,63 @@ from .config import (
 
 
 def log_message(message: str) -> None:
-    """Append a log message to the daemon log."""
+    """Append a log message to the daemon log, rotating it when oversized."""
     ensure_state_layout()
     timestamp = datetime.now(timezone.utc).isoformat()
-    with get_log_path().open("a", encoding="utf-8") as handle:
+    path = get_log_path()
+    with path.open("a", encoding="utf-8") as handle:
         handle.write(f"{timestamp} {message}\n")
+        handle.flush()
+        size = handle.tell()
+    max_bytes = get_log_max_bytes()
+    if max_bytes and size >= max_bytes:
+        rotate_log(max_bytes=max_bytes, backups=get_log_backup_count())
+
+
+def _rotated_log_path(path: Path, index: int) -> Path:
+    return path.with_name(f"{path.name}.{index}")
+
+
+def rotate_log(
+    *, max_bytes: Optional[int] = None, backups: Optional[int] = None
+) -> bool:
+    """Rotate the daemon log if it reached *max_bytes*.
+
+    Returns True when a rotation happened.  Hook invocations run in separate
+    processes, so the size check and rename sequence are serialized through a
+    lock file next to the log.
+    """
+    max_bytes = get_log_max_bytes() if max_bytes is None else max_bytes
+    backups = get_log_backup_count() if backups is None else backups
+    if not max_bytes:
+        return False
+
+    path = get_log_path()
+    if not path.exists():
+        return False
+
+    ensure_state_layout()
+    lock_path = path.with_name(f"{path.name}.lock")
+    with lock_path.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                if path.stat().st_size < max_bytes:
+                    return False
+            except FileNotFoundError:
+                return False
+            if backups <= 0:
+                path.write_text("", encoding="utf-8")
+                return True
+            _rotated_log_path(path, backups).unlink(missing_ok=True)
+            for index in range(backups - 1, 0, -1):
+                source = _rotated_log_path(path, index)
+                if source.exists():
+                    os.replace(source, _rotated_log_path(path, index + 1))
+            os.replace(path, _rotated_log_path(path, 1))
+            return True
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 @contextmanager
@@ -108,6 +164,98 @@ def replace_spool_events(events: List[Dict[str, Any]]) -> None:
         handle.truncate()
         for event in events:
             handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def trim_spool(max_events: int) -> int:
+    """Drop the oldest spool events beyond *max_events* and return how many.
+
+    A permanently failing export (bad key, unreachable data plane) would
+    otherwise grow ``spool/events.jsonl`` without bound.
+    """
+    if max_events <= 0:
+        return 0
+    path = get_spool_path()
+    if not path.exists():
+        return 0
+    with _locked_text_file(path) as handle:
+        events = _parse_spool_lines(handle.readlines())
+        if len(events) <= max_events:
+            return 0
+        dropped = len(events) - max_events
+        handle.seek(0)
+        handle.truncate()
+        for event in events[dropped:]:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+        return dropped
+
+
+def discard_acked_session_events(session_id: str) -> None:
+    """Drop locally buffered events for a session HoneyHive has acknowledged.
+
+    Called once the session artifact update is acked, so chat history, buffered
+    tool events, and per-request usage claims don't linger on disk.  The small
+    session index entry is kept (it guards against duplicate ``session.start``
+    exports on resume) and is removed later by :func:`prune_finished_sessions`.
+    """
+    with _locked_json_mapping(
+        get_chat_histories_path(), "skipped malformed chat histories index"
+    ) as histories:
+        histories.pop(session_id, None)
+
+    with _locked_json_mapping(
+        get_pending_tools_path(), "skipped malformed pending tools index"
+    ) as pending:
+        for key in list(pending):
+            if key.split(":", 1)[0] == session_id:
+                pending.pop(key, None)
+
+    with _locked_session_index() as index:
+        session = index.get(session_id)
+        if session is not None:
+            session.pop("tool_usage_request_ids", None)
+            index[session_id] = session
+
+
+def prune_finished_sessions(max_age_ms: int, *, now_ms: int) -> int:
+    """Drop state for sessions finished longer ago than *max_age_ms*.
+
+    Removes the session index entry plus its chat history and any leftover
+    buffered tool events.  Sessions whose artifact has not been pushed yet are
+    kept so the daemon can still finalize them.
+    """
+    if max_age_ms <= 0:
+        return 0
+
+    stale: List[str] = []
+    with _locked_session_index() as index:
+        for session_id, session in list(index.items()):
+            if not session.get("artifact_pushed"):
+                continue
+            last_activity_ms = int(session.get("last_activity_ms", 0))
+            pushed_at_ms = int(session.get("artifact_pushed_at_ms", 0))
+            if now_ms - max(last_activity_ms, pushed_at_ms) < max_age_ms:
+                continue
+            stale.append(session_id)
+            index.pop(session_id, None)
+
+    if not stale:
+        return 0
+
+    stale_ids = set(stale)
+    with _locked_json_mapping(
+        get_chat_histories_path(), "skipped malformed chat histories index"
+    ) as histories:
+        for session_id in stale_ids:
+            histories.pop(session_id, None)
+
+    with _locked_json_mapping(
+        get_pending_tools_path(), "skipped malformed pending tools index"
+    ) as pending:
+        for key in list(pending):
+            if key.split(":", 1)[0] in stale_ids:
+                pending.pop(key, None)
+
+    return len(stale)
 
 
 def load_session_index() -> Dict[str, Dict[str, Any]]:
