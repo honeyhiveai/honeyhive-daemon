@@ -964,7 +964,7 @@ def test_export_event_posts_honeyhive_event(monkeypatch, tmp_path: Path) -> None
     assert captured["api_key"] == "hh_test"
     assert captured["base_url"] == "https://api.honeyhive.ai"
     assert captured["event"]["event_id"] == "evt-1"
-    assert not captured["event"].get("project")
+    assert not captured["event"].get("project")  # project no longer in payload
     assert captured["event"]["event_type"] == "tool"
     assert captured["event"]["event_name"] == "tool.bash"
     assert captured["event"]["parent_id"] == "sess-1"
