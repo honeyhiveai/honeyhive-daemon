@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "honeyhive-observability",
+  "displayName": "HoneyHive Observability",
+  "description": "Export Claude Code session telemetry to HoneyHive. Captures tool calls, prompts, turns, permission decisions, subagents and session artifacts for observability and evaluation.",
+  "version": "0.7.5",
+  "author": {
+    "name": "HoneyHive",
+    "email": "support@honeyhive.ai",
+    "url": "https://honeyhive.ai"
+  },
+  "homepage": "https://honeyhive.ai",
+  "repository": "https://github.com/honeyhiveai/honeyhive-daemon",
+  "license": "Apache-2.0",
+  "keywords": [
+    "observability",
+    "telemetry",
+    "tracing",
+    "evaluation",
+    "honeyhive",
+    "monitoring"
+  ],
+  "userConfig": {
+    "HH_API_KEY": {
+      "type": "string",
+      "title": "HoneyHive API key",
+      "description": "Your HoneyHive API key. The project is resolved from the key. Leave empty to use an HH_API_KEY already exported in your shell, or the key stored by 'honeyhive-daemon init'.",
+      "sensitive": true
+    },
+    "HH_API_URL": {
+      "type": "string",
+      "title": "HoneyHive API URL",
+      "description": "Base URL for the HoneyHive API. Only set this for self-hosted or non-default endpoints. Leave empty to use the daemon default."
+    },
+    "HONEYHIVE_DAEMON_BIN": {
+      "type": "string",
+      "title": "Daemon executable",
+      "description": "Absolute path to the 'honeyhive-daemon' executable. Only needed when the daemon is installed in a virtualenv that is not on the PATH Claude Code sees. Leave empty to resolve it from PATH."
+    }
+  }
+}
